@@ -1,13 +1,17 @@
 """Measure recovery of face-connected dielectric components against voxel masks."""
 
 import numpy as np
-from scipy.ndimage import label
+from scipy.ndimage import generate_binary_structure, label
 from scipy.optimize import linear_sum_assignment
 
 
-def component_counts(prediction, target):
-    predicted, n_pred = label(prediction)
-    actual, n_true = label(target)
+def component_counts(prediction, target, connectivity=6):
+    """Count one-to-one matches with the same voxel adjacency on both masks."""
+    if connectivity not in (6, 26):
+        raise ValueError('Expected 6- or 26-connected voxel adjacency')
+    neighbors = generate_binary_structure(3, 1 if connectivity == 6 else 3)
+    predicted, n_pred = label(prediction, structure=neighbors)
+    actual, n_true = label(target, structure=neighbors)
     table = np.bincount((actual * (n_pred + 1) + predicted).ravel(),
                         minlength=(n_true+1)*(n_pred+1)).reshape(n_true+1, n_pred+1)
     intersection = table[1:, 1:]
