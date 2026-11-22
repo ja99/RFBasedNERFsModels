@@ -1,6 +1,7 @@
 """Reconstruct a laboratory scene from its measured and empty RF recordings.
 
-Compact single mode estimates occupancy, distance and material. Compact mixed mode estimates geometry.
+Compact single mode estimates occupancy, distance and material. Compact mixed mode estimates geometry,
+or fits one or two RF-selected inclusions and their materials with --refine.
 Metre mode returns a one-object occupancy mask and geometry estimate on the native lattice.
 """
 
@@ -85,8 +86,8 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
         raise ValueError("Choose single, mixed or metre mode and a cpu or cuda device")
     if scene_id is not None and mode != "metre":
         raise ValueError("--scene-id selects a recording from the metre archive")
-    if refine and mode != "single":
-        raise ValueError("Waveform refinement requires single mode")
+    if refine and mode == "metre":
+        raise ValueError("Waveform refinement requires compact single or mixed mode")
     scene, output = Path(scene).resolve(), Path(output).expanduser()
     protected = ("acquisition.json", "sensor_samples.npy", "empty_sensor_samples.npy", "reference_calibration.json",
                  "scene.json", "grid.npy")
@@ -103,13 +104,14 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
     acquisition = json.loads((scene / "acquisition.json").read_text())
     protocol = acquisition_protocol(acquisition)
     if mode == "mixed" and protocol != "dielectric":
-        raise ValueError("The released mixed volume model requires the compact dielectric acquisition")
+        raise ValueError("The released mixed models require the compact dielectric acquisition")
     if refine:
+        filename = "RefineInstances.py" if mode == "mixed" else "RefinePhantom.py"
         script = Path(simulator or DEFAULT_SIMULATOR).expanduser().resolve()
         if script.is_dir():
-            script = script / "RefinePhantom.py"
+            script = script / filename
         if not script.is_file():
-            raise FileNotFoundError(f"Pass --simulator pointing to the checkout containing RefinePhantom.py: {script}")
+            raise FileNotFoundError(f"Pass --simulator pointing to the checkout containing {filename}: {script}")
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=output.parent) as scratch:
@@ -119,7 +121,26 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
             corrected = Path(scratch) / "reference" / scene.name
             calibration = calibrate_scene(scene, corrected, clearance_cells)
             scene = corrected
-        if mode == "mixed":
+        if mode == "single":
+            kernel = EchoKernel(release_asset(f"{protocol}-kernel.npz", cache, manifest))
+            sdf = kernel.predict_scene(scene)
+            if refine:
+                initial = Path(scratch) / "initial.npy"
+                np.save(initial, sdf)
+            else:
+                model = EchoMaterial(release_asset(f"{protocol}-material.npz", cache, manifest))
+                materials = model.compose(model.predict_scene(scene), sdf)
+                np.savez_compressed(prediction, sdf_cells=sdf, occupied=sdf < 0, permittivity=materials[..., 0],
+                                    conductivity_s_per_m=materials[..., 1], grid_origin_cells=acquisition["grid_origin_cells"],
+                                    grid_spacing_m=acquisition["grid_spacing_m"], scene_id=scene.name)
+        elif refine:
+            from EchoSet import SetPredictor
+
+            checkpoint = release_asset("mixed-set.pt", cache, manifest)
+            _, masks, centers, probability = SetPredictor(checkpoint, device).predict_scene(scene)
+            initial = Path(scratch) / "instances.npz"
+            np.savez_compressed(initial, masks=masks, centers_cells=centers, probability_two=probability)
+        else:
             from EchoReconstructor import predict
 
             checkpoint = release_asset("mixed-volume.pt", cache, manifest)
@@ -127,22 +148,11 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
                                    device=device, output=prediction)
             with redirect_stdout(io.StringIO()):
                 predict(args)
-        else:
-            kernel = EchoKernel(release_asset(f"{protocol}-kernel.npz", cache, manifest))
-            sdf = kernel.predict_scene(scene)
-            if refine:
-                initial = Path(scratch) / "initial.npy"
-                np.save(initial, sdf)
-                material = "thesis" if protocol == "conductive" else "dielectric"
-                # The sibling projects have distinct modules with identical names.
-                subprocess.run([sys.executable, str(script), str(scene), str(initial), str(prediction),
-                                "--material", material, "--device", device], check=True)
-            else:
-                model = EchoMaterial(release_asset(f"{protocol}-material.npz", cache, manifest))
-                materials = model.compose(model.predict_scene(scene), sdf)
-                np.savez_compressed(prediction, sdf_cells=sdf, occupied=sdf < 0, permittivity=materials[..., 0],
-                                    conductivity_s_per_m=materials[..., 1], grid_origin_cells=acquisition["grid_origin_cells"],
-                                    grid_spacing_m=acquisition["grid_spacing_m"], scene_id=scene.name)
+        if refine:
+            material = "thesis" if protocol == "conductive" else "dielectric"
+            # The sibling projects have distinct modules with identical names.
+            subprocess.run([sys.executable, str(script), str(scene), str(initial), str(prediction),
+                            "--material", material, "--device", device], check=True)
         if calibration is not None:
             with ZipFile(prediction, "a", compression=ZIP_DEFLATED) as archive:
                 with archive.open("reference_calibration_json.npy", "w") as record:
@@ -158,7 +168,8 @@ def main():
     parser.add_argument("--mode", choices=("single", "mixed", "metre"), default="single",
                         help="Single compact material and geometry, mixed compact geometry, or metre single-shot geometry")
     parser.add_argument("--scene-id", help="Select a recording from a multi-scene metre archive")
-    parser.add_argument("--refine", action="store_true", help="Fit one homogeneous inclusion to the measured waveform")
+    parser.add_argument("--refine", action="store_true",
+                        help="Fit compact geometry and materials to the waveform, using one or two RF-selected inclusions in mixed mode")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu", help="Device for mixed mode or refinement")
     parser.add_argument("--clearance-cells", type=int,
                         help=CLEARANCE_HELP + ". Enables gain correction and stores its diagnostics in the output NPZ.")

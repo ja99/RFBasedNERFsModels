@@ -145,8 +145,65 @@ class ReconstructTests(unittest.TestCase):
         with np.load(self.output, allow_pickle=False) as result:
             np.testing.assert_array_equal(result["occupied"], self.mask)
             np.testing.assert_array_equal(result["permittivity"], np.where(self.mask, 57, 1))
-        with self.assertRaisesRegex(ValueError, "single"):
-            Reconstruct.reconstruct(self.scene, self.output, mode="mixed", refine=True)
+        with self.assertRaisesRegex(ValueError, "compact"):
+            Reconstruct.reconstruct(self.scene, self.output, mode="metre", refine=True)
+
+    def test_mixed_refinement_passes_rf_selected_slots_and_corrected_recordings_to_sibling(self):
+        import torch
+        from EchoSet import EchoSet, SetPredictor
+
+        metadata = self.raw_pair("dielectric")
+        metadata.update(sensor_layout="antenna,direction,timestep", antenna_positions_cells=[[7,6,6],[7,9,6]],
+                        transmit_positions_cells=[[7,7,6],[7,10,6]], beamforming_angles_deg=[[0,0]],
+                        time_step_s=8.58e-12, sample_stride=2, samples_per_shot=32,
+                        grid_shape=[19, 17, 18], pml_thickness=4)
+        (self.scene / "acquisition.json").write_text(json.dumps(metadata))
+        self.wave[..., :3] = 0.
+        reference = np.random.default_rng(18).normal(size=self.wave.shape)
+        drifted = reference * np.array([1.02, .98])[:, None, None]
+        np.save(self.scene / "sensor_samples.npy", reference + self.wave)
+        np.save(self.scene / "empty_sensor_samples.npy", drifted)
+
+        settings = dict(acquisition=metadata, sensor_shape=list(self.wave.shape), grid_shape=list(self.shape),
+                        sensor_offset=.25, sensor_scale=.5)
+        transforms = [[torch.zeros(g.size), torch.ones(g.size), torch.ones((g.size, 1))]
+                      for g in _echo_features(self.wave)]
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(11)
+            model = EchoSet(3, self.shape, hidden=16, shape_rank=2, landmarks=3)
+        checkpoint = self.weights / "mixed-set.pt"
+        torch.save(dict(format_version=1, model_type="echo_set", config=model.config, weights=model.state_dict(),
+                        transforms=transforms, settings=settings, prior=torch.from_numpy(self.mask), prior_id="toy",
+                        training_ids=[], validation={"offset": 0., "threshold": 0.}), checkpoint)
+        self.register(checkpoint.name)
+        normalized = ((self.wave - .25) / .5).astype("f4")
+        _, masks, centers, p_two = SetPredictor(checkpoint).fields(normalized[None])[0]
+        self.assertEqual(len(masks), 2)
+        sibling = self.root / "simulator"
+        sibling.mkdir()
+        (sibling / "RefineInstances.py").write_text(
+            "import sys\nfrom pathlib import Path\nimport numpy as np\n"
+            "scene, slots, out = map(Path, sys.argv[1:4])\n"
+            "assert sys.argv[4:] == ['--material', 'dielectric', '--device', 'cpu']\n"
+            "assert not (scene/'grid.npy').exists() and not (scene/'scene.json').exists()\n"
+            "residual = np.load(scene/'sensor_samples.npy') - np.load(scene/'empty_sensor_samples.npy')\n"
+            "with np.load(slots, allow_pickle=False) as inputs:\n"
+            "    np.savez(out, instance_masks=inputs['masks'], centers=inputs['centers_cells'],\n"
+            "             probability=inputs['probability_two'], used_residual=residual)\n")
+        Reconstruct.reconstruct(self.scene, self.output, weights_dir=self.weights, simulator=sibling,
+                                mode="mixed", refine=True, clearance_cells=3)
+        with np.load(self.output, allow_pickle=False) as result:
+            np.testing.assert_array_equal(result["instance_masks"], masks)
+            np.testing.assert_allclose(result["centers"], centers, atol=1e-6)
+            self.assertAlmostEqual(float(result["probability"]), p_two, places=6)
+            np.testing.assert_allclose(result["used_residual"], self.wave, atol=1e-14)
+            gains = json.loads(result["reference_calibration_json"].item())["gain_by_receiver"]
+            np.testing.assert_allclose(gains, [1/1.02, 1/.98])
+        np.testing.assert_array_equal(np.load(self.scene / "empty_sensor_samples.npy"), drifted)
+        (self.scene / "acquisition.json").write_text(json.dumps(dict(metadata, frequency_hz=1.)))
+        with self.assertRaisesRegex(ValueError, "acquisition"):
+            Reconstruct.reconstruct(self.scene, self.output, weights_dir=self.weights, simulator=sibling,
+                                    mode="mixed", refine=True)
 
     def test_gain_corrected_pair_reaches_single_and_refined_paths(self):
         metadata = self.raw_pair("dielectric")
