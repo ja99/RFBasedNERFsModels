@@ -223,7 +223,7 @@ def _validation_iou(predicted, masks, offsets):
     return scores / len(masks)
 
 
-def fit(data, output):
+def fit(data, output, *, reflections=True):
     rng = np.random.default_rng(734)
     with _archive(data) as f:
         settings = _settings(f)
@@ -232,6 +232,8 @@ def fit(data, output):
         if not len(train) or not len(validation) or np.intersect1d(train, validation).size:
             raise ValueError('Fitting requires separate, nonempty training and validation splits')
         variants = _reflections(settings)
+        if not reflections:
+            variants = variants[:1]
         feature_rows, targets, templates = [], [], []
         for i in train:
             wave = _signal(f, i, settings)
@@ -417,6 +419,7 @@ def main():
     fit_args = commands.add_parser('fit')
     fit_args.add_argument('--data', type=Path, required=True)
     fit_args.add_argument('--output', type=Path, required=True)
+    fit_args.add_argument('--no-reflections', action='store_true', help='Fit using only measured training views')
     eval_args = commands.add_parser('evaluate')
     eval_args.add_argument('--data', type=Path, required=True)
     eval_args.add_argument('--model', type=Path, required=True)
@@ -431,7 +434,7 @@ def main():
     infer.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     if args.action == 'fit':
-        report = fit(args.data, args.output)
+        report = fit(args.data, args.output, reflections=not args.no_reflections)
     elif args.action == 'evaluate':
         report = evaluate(EchoKernel(args.model), args.data, args.split)
         if args.output:
