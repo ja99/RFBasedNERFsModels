@@ -23,6 +23,8 @@ from scipy.optimize import least_squares
 from scipy.spatial.distance import cdist
 from scipy.spatial.transform import Rotation
 
+from CalibrateReference import CLEARANCE_HELP, calibrate_pair
+
 C = 299792458.
 VERSION = 1
 SHAPE_KEYS = ("centers_cells", "kind", "radius_cells", "sizes_cells", "euler_deg")
@@ -41,9 +43,10 @@ class Recordings:
     ids: np.ndarray
     split: np.ndarray
     acquisition: dict
+    reference_calibration: dict | None = None
 
 
-def recordings(path):
+def recordings(path, *, single=False, scene_id=None, clearance_cells=None):
     # Geometry members of an NPZ are never opened by prediction.
     with np.load(archive(path), allow_pickle=False) as data:
         raw = data["sensor_samples"].astype(np.float64)
@@ -65,7 +68,19 @@ def recordings(path):
         raise ValueError("Nonfinite recorded voltages")
     if acquisition["beamforming_angles_deg"] != [[0., 0.]] or acquisition["voltage_units"] != "V":
         raise ValueError("Expected a single broadside excitation and voltages in V")
-    return Recordings((raw - empty)[:, :, 0], ids, split, acquisition)
+    if single:
+        if scene_id is None and len(ids) != 1:
+            raise ValueError("Select --scene-id when predicting from multiple recordings")
+        selected = np.flatnonzero(ids == scene_id) if scene_id is not None else np.array([0])
+        if len(selected) != 1:
+            raise ValueError(f"Scene ID {scene_id!r} absent")
+        raw, ids, split = raw[selected], ids[selected], split[selected]
+    calibration = None
+    if clearance_cells is not None:
+        if len(raw) != 1:
+            raise ValueError("Fit direct-path gain separately for each measured recording")
+        empty, calibration = calibrate_pair(raw[0], empty, acquisition, clearance_cells)
+    return Recordings((raw - empty)[:, :, 0], ids, split, acquisition, calibration)
 
 
 def geometry(path, indices):
@@ -471,24 +486,21 @@ def evaluate(path, checkpoint):
                 results={k: score(v, pred, masks, truth, data.ids, data.acquisition) for k, (v, pred) in methods.items()})
 
 
-def predict_scene(path, checkpoint, scene_id, output):
-    data, model = recordings(path), Estimator(checkpoint)
-    if scene_id is None:
-        if len(data.ids) != 1:
-            raise ValueError("Select --scene-id when predicting from multiple recordings")
-        scene_id = str(data.ids[0])
-    ids = np.flatnonzero(data.ids == scene_id)
-    if len(ids) != 1:
-        raise ValueError(f"Scene ID {scene_id!r} absent")
-    one = Recordings(data.echo[ids], data.ids[ids], data.split[ids], data.acquisition)
+def predict_scene(path, checkpoint, scene_id, output, *, clearance_cells=None):
+    if Path(output).resolve() in (archive(path).resolve(), Path(checkpoint).resolve()):
+        raise ValueError("Choose an output path distinct from the recording and checkpoint")
+    one = recordings(path, single=True, scene_id=scene_id, clearance_cells=clearance_cells)
+    model = Estimator(checkpoint)
     vector = model.predict(one)[0]
-    origin, end = roi(data.acquisition)
+    origin, end = roi(one.acquisition)
     mask = np.zeros(tuple(end-origin), dtype=bool)
-    mask.flat[predicted_voxels(vector, data.acquisition)] = True
+    mask.flat[predicted_voxels(vector, one.acquisition)] = True
+    provenance = ({"reference_calibration_json": json.dumps(one.reference_calibration, allow_nan=False)}
+                  if one.reference_calibration is not None else {})
     atomic_npz(output, occupancy=mask, center_cells=vector[:3], radius_scale_cells=np.exp(vector[3]),
                nonzero_echo=bool(one.echo.any()),
-               quartic_coefficients=vector[4:], roi_origin_cells=origin, scene_id=scene_id,
-               acquisition_json=json.dumps(data.acquisition, sort_keys=True))
+               quartic_coefficients=vector[4:], roi_origin_cells=origin, scene_id=str(one.ids[0]),
+               acquisition_json=json.dumps(one.acquisition, sort_keys=True), **provenance)
 
 
 def main():
@@ -501,6 +513,7 @@ def main():
         if key != "train":
             q.add_argument("--output", type=Path, required=True)
         if key == "predict":
+            q.add_argument("--clearance-cells", type=int, help=CLEARANCE_HELP)
             q.add_argument("--scene-id", help="Required when the archive contains multiple recordings")
     args = p.parse_args()
     if args.command == "train":
@@ -511,7 +524,7 @@ def main():
         args.output.write_text(json.dumps(report, indent=2, allow_nan=False)+"\n")
         print(json.dumps({k: v["summary"] for k, v in report["results"].items()}, indent=2))
     else:
-        predict_scene(args.data, args.checkpoint, args.scene_id, args.output)
+        predict_scene(args.data, args.checkpoint, args.scene_id, args.output, clearance_cells=args.clearance_cells)
 
 
 if __name__ == "__main__":

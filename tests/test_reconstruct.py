@@ -148,6 +148,39 @@ class ReconstructTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "single"):
             Reconstruct.reconstruct(self.scene, self.output, mode="mixed", refine=True)
 
+    def test_gain_corrected_pair_reaches_single_and_refined_paths(self):
+        metadata = self.raw_pair("dielectric")
+        metadata.update(antenna_positions_cells=[[7,6,6],[7,9,6]], transmit_positions_cells=[[7,7,6],[7,10,6]],
+                        beamforming_angles_deg=[[0,0]], time_step_s=8.58e-12, sample_stride=2, samples_per_shot=32,
+                        grid_shape=[19, 17, 18], pml_thickness=4)
+        (self.scene / "acquisition.json").write_text(json.dumps(metadata))
+        clean = np.random.default_rng(17).normal(size=(1,2,32))
+        self.wave[..., :3] = 0.
+        measured = clean + self.wave.swapaxes(0, 1)
+        drift = clean * np.array([1.01, .99])[None,:,None]
+        np.save(self.scene / "sensor_samples.npy", measured)
+        np.save(self.scene / "empty_sensor_samples.npy", drift)
+        self.single_assets("dielectric", metadata)
+        with patch.object(EchoKernel, "predict", autospec=True, side_effect=EchoKernel.predict) as kernel:
+            Reconstruct.reconstruct(self.scene, self.output, weights_dir=self.weights, clearance_cells=3)
+        np.testing.assert_allclose(kernel.call_args.args[1], (self.wave-.25)/.5, atol=1e-7)
+        with np.load(self.output) as prediction:
+            gains = json.loads(prediction["reference_calibration_json"].item())["gain_by_receiver"]
+            np.testing.assert_allclose(gains, [1/1.01, 1/.99])
+            np.testing.assert_array_equal(prediction["occupied"], self.mask)
+        simulator = self.root / "RefinePhantom.py"
+        simulator.write_text("from pathlib import Path\nimport sys, numpy as np\n"
+                             "scene, initial, output = map(Path, sys.argv[1:4])\n"
+                             "measured = np.load(scene/'sensor_samples.npy')\n"
+                             "reference = np.load(scene/'empty_sensor_samples.npy')\n"
+                             "np.savez(output, used_residual=measured-reference)\n")
+        Reconstruct.reconstruct(self.scene, self.output, weights_dir=self.weights, clearance_cells=3,
+                                simulator=simulator, refine=True)
+        with np.load(self.output) as out:
+            self.assertIn("reference_calibration_json", out.files)
+            np.testing.assert_allclose(out["used_residual"], self.wave.swapaxes(0,1), atol=1e-14)
+        np.testing.assert_array_equal(np.load(self.scene/"empty_sensor_samples.npy"), drift)
+
     def test_cache_verifies_existing_downloads_and_preserves_prior_file_on_failure(self):
         name = "dielectric-kernel.npz"
         path = self.weights / name

@@ -1,4 +1,8 @@
-"""Reconstruct a compact benchmark scene from its measured and empty RF recordings."""
+"""Reconstruct a laboratory scene from its measured and empty RF recordings.
+
+Compact single mode estimates occupancy, distance and material. Compact mixed mode estimates geometry.
+Metre mode returns a one-object occupancy mask and geometry estimate on the native lattice.
+"""
 
 import argparse
 from contextlib import redirect_stdout
@@ -13,9 +17,11 @@ import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from urllib.request import urlopen
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import numpy as np
 
+from CalibrateReference import CLEARANCE_HELP, calibrate_scene
 from EchoKernel import EchoKernel
 from EchoMaterial import EchoMaterial
 
@@ -72,16 +78,28 @@ def acquisition_protocol(acquisition):
     raise ValueError(f"No released compact acquisition uses grid_spacing_m={spacing!r}")
 
 
-def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", weights_dir=None, simulator=None):
-    """Predict a native-grid NPZ from acquisition.json and the two receiver recordings."""
-    if mode not in ("single", "mixed") or device not in ("cpu", "cuda"):
-        raise ValueError("Choose single or mixed mode and a cpu or cuda device")
+def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", weights_dir=None, simulator=None,
+                clearance_cells=None, scene_id=None):
+    """Predict on the protocol’s native grid using its paired receiver recordings."""
+    if mode not in ("single", "mixed", "metre") or device not in ("cpu", "cuda"):
+        raise ValueError("Choose single, mixed or metre mode and a cpu or cuda device")
+    if scene_id is not None and mode != "metre":
+        raise ValueError("--scene-id selects a recording from the metre archive")
     if refine and mode != "single":
         raise ValueError("Waveform refinement requires single mode")
     scene, output = Path(scene).resolve(), Path(output).expanduser()
-    protected = ("acquisition.json", "sensor_samples.npy", "empty_sensor_samples.npy", "scene.json", "grid.npy")
+    protected = ("acquisition.json", "sensor_samples.npy", "empty_sensor_samples.npy", "reference_calibration.json",
+                 "scene.json", "grid.npy")
     if output.resolve() in {scene / name for name in protected}:
         raise ValueError("Choose a separate reconstruction output path")
+    manifest = json.loads(MANIFEST.read_text())
+    cache = weights_dir if weights_dir is not None else Path.home() / ".cache" / "rf-thesis"
+    if mode == "metre":
+        from MeterReconstruction import predict_scene
+
+        checkpoint = release_asset("metre-single-shot.npz", cache, manifest)
+        predict_scene(scene, checkpoint, scene_id, output, clearance_cells=clearance_cells)
+        return output
     acquisition = json.loads((scene / "acquisition.json").read_text())
     protocol = acquisition_protocol(acquisition)
     if mode == "mixed" and protocol != "dielectric":
@@ -93,11 +111,14 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
         if not script.is_file():
             raise FileNotFoundError(f"Pass --simulator pointing to the checkout containing RefinePhantom.py: {script}")
 
-    manifest = json.loads(MANIFEST.read_text())
-    cache = weights_dir if weights_dir is not None else Path.home() / ".cache" / "rf-thesis"
     output.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=output.parent) as scratch:
         prediction = Path(scratch) / "prediction.npz"
+        calibration = None
+        if clearance_cells is not None:
+            corrected = Path(scratch) / "reference" / scene.name
+            calibration = calibrate_scene(scene, corrected, clearance_cells)
+            scene = corrected
         if mode == "mixed":
             from EchoReconstructor import predict
 
@@ -122,17 +143,25 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
                 np.savez_compressed(prediction, sdf_cells=sdf, occupied=sdf < 0, permittivity=materials[..., 0],
                                     conductivity_s_per_m=materials[..., 1], grid_origin_cells=acquisition["grid_origin_cells"],
                                     grid_spacing_m=acquisition["grid_spacing_m"], scene_id=scene.name)
+        if calibration is not None:
+            with ZipFile(prediction, "a", compression=ZIP_DEFLATED) as archive:
+                with archive.open("reference_calibration_json.npy", "w") as record:
+                    np.save(record, json.dumps(calibration, allow_nan=False), allow_pickle=False)
         prediction.replace(output)
     return output
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("scene", type=Path, help="Directory containing acquisition.json and the two raw RF recordings")
+    parser.add_argument("scene", type=Path, help="Compact raw scene directory or metre signals.npz recording archive")
     parser.add_argument("output", type=Path, help="Destination prediction NPZ")
-    parser.add_argument("--mode", choices=("single", "mixed"), default="single")
+    parser.add_argument("--mode", choices=("single", "mixed", "metre"), default="single",
+                        help="Single compact material and geometry, mixed compact geometry, or metre single-shot geometry")
+    parser.add_argument("--scene-id", help="Select a recording from a multi-scene metre archive")
     parser.add_argument("--refine", action="store_true", help="Fit one homogeneous inclusion to the measured waveform")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu", help="Device for mixed mode or refinement")
+    parser.add_argument("--clearance-cells", type=int,
+                        help=CLEARANCE_HELP + ". Enables gain correction and stores its diagnostics in the output NPZ.")
     parser.add_argument("--weights-dir", type=Path, help="Verified weights cache (default ~/.cache/rf-thesis)")
     parser.add_argument("--simulator", type=Path, help="Simulator checkout for --refine (default sibling checkout)")
     args = parser.parse_args()

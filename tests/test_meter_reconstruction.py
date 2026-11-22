@@ -8,6 +8,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 import MeterReconstruction as m
+import Reconstruct
 
 
 def synthetic(path, count=30, start=0, sealed=False):
@@ -91,6 +92,18 @@ class TestMeterReconstruction(unittest.TestCase):
             m.predict_scene(unlabeled, ckpt, "p100", root/"out.npz")
             with np.load(root/"out.npz") as result:
                 self.assertEqual(result["occupancy"].sum(), scores["reconstruction"]["scenes"][0]["occupied_predicted"])
+            with patch.object(Reconstruct, "release_asset", return_value=ckpt) as asset:
+                Reconstruct.reconstruct(unlabeled, root/"wrapper.npz", mode="metre", scene_id="p100")
+                self.assertEqual(asset.call_args.args[0], "metre-single-shot.npz")
+                with np.load(root/"out.npz") as direct, np.load(root/"wrapper.npz") as wrapped:
+                    self.assertEqual(set(direct.files), set(wrapped.files))
+                    for key in direct.files:
+                        np.testing.assert_array_equal(direct[key], wrapped[key])
+                Reconstruct.reconstruct(unlabeled, root/"calibrated.npz", mode="metre", scene_id="p100", clearance_cells=3)
+                with np.load(root/"calibrated.npz") as calibrated:
+                    self.assertEqual(json.loads(calibrated["reference_calibration_json"].item())["gain_ports"], 16)
+                with self.assertRaisesRegex(ValueError, "Select --scene-id"):
+                    Reconstruct.reconstruct(unlabeled, root/"wrapper.npz", mode="metre")
             silent = dict(sensor_samples=raw["empty_sensor_samples"][None], empty_sensor_samples=raw["empty_sensor_samples"],
                           acquisition_json=raw["acquisition_json"])
             np.savez(root/"silent.npz", **silent)
