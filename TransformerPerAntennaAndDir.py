@@ -1,23 +1,15 @@
 import datetime
 import math
-import pathlib
-import random
 from enum import Enum
-from typing import Tuple
-import wandb
 
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import pytorch_lightning as pl
-from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
+import torch
+from torch import nn
+from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 
-from Visualizer import visualize_sdf, visualize_permittivity
-from helpers import sample_indices
-
 import CustomDataset
+from field_training import DEFAULT_DATA_PATH, PointQueryModel, evaluate_checkpoint, run_cli
 
 
 class PositionalEncodingType(Enum):
@@ -40,23 +32,25 @@ class TransformerEncoder(pl.LightningModule):
 
         self.encoder_embedding = nn.Linear(n_timesteps, d_model)
 
-        if position_encoding == PositionalEncodingType.sinusoidal:
-            self.positional_encoding = self.create_sinusoidal_positional_encoding(n_antennas, d_model)
-        elif position_encoding == PositionalEncodingType.learned:
-            self.positional_encoding = nn.Embedding(n_antennas, d_model)
+        self.set_position_encoding(position_encoding, n_antennas, d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
                                                    dropout=dropout, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
 
-        self.position_encoding = position_encoding
+    def set_position_encoding(self, mode, n_tokens, d_model):
+        if hasattr(self, "positional_encoding"):
+            del self.positional_encoding
+        self.position_encoding = mode
+        if mode == PositionalEncodingType.sinusoidal:
+            encoding = self.create_sinusoidal_positional_encoding(n_tokens, d_model)
+            self.register_buffer("positional_encoding", encoding, persistent=False)
+        else:
+            self.positional_encoding = nn.Embedding(n_tokens, d_model)
 
     def forward(self, src: torch.Tensor) -> torch.Tensor:
-        B, a, t = src.shape
-        src_reshaped = src.view(-1, t)
-
-        y = self.encoder_embedding(src_reshaped)
-        src = y.view(B, a, -1)
+        a = src.size(1)
+        src = self.encoder_embedding(src)
 
         # Add positional encoding
         if self.position_encoding == PositionalEncodingType.sinusoidal:
@@ -73,50 +67,37 @@ class TransformerEncoder(pl.LightningModule):
         div_term = torch.exp(torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model))
         sinusoidal_encoding = torch.zeros(n_timesteps, d_model)
         sinusoidal_encoding[:, 0::2] = torch.sin(position * div_term)
-        sinusoidal_encoding[:, 1::2] = torch.cos(position * div_term)
+        sinusoidal_encoding[:, 1::2] = torch.cos(position * div_term[:d_model // 2])
 
-        return sinusoidal_encoding.to("cuda")
+        return sinusoidal_encoding
 
 
-class CustomTransformer(pl.LightningModule):
+class IndependentQueryDecoderLayer(nn.TransformerDecoderLayer):
+    """Run each coordinate through self-attention alone, sharing cross-attention memory across coordinates."""
+
+    def _sa_block(self, x, attn_mask, key_padding_mask, is_causal=False):
+        if attn_mask is not None or key_padding_mask is not None or is_causal:
+            return super()._sa_block(x, attn_mask, key_padding_mask, is_causal)
+        singleton = x.reshape(-1, 1, x.size(-1))
+        return super()._sa_block(singleton, None, None).reshape_as(x)
+
+
+class CustomTransformer(PointQueryModel):
     def __init__(self, n_antennas: int, n_timesteps: int, dim_position: int, dim_output: int, d_model: int, nhead: int,
                  num_encoder_layers: int, num_decoder_layers: int, dim_feedforward: int, dropout: float = 0.1,
                  learning_rate: float = 1e-3, internal_batch_size_training: int = 16,
                  internal_batch_size_validation: int = 16,
                  position_encoding: PositionalEncodingType = PositionalEncodingType.learned
                  ):
-        """
-        Custom Transformer model built using PyTorch Lightning.
-
-        Args:
-            n_antennas (int): Number of antennas in the input data.
-            n_timesteps (int): Number of time steps in the input data.
-            dim_position (int): Dimension of the position/query tensor.
-            dim_output (int): Dimension of the output tensor.
-            d_model (int): The dimension of the model (commonly used in transformer models).
-            nhead (int): Number of heads in the multiheadattention models.
-            num_encoder_layers (int): Number of sub-encoder-layers in the encoder.
-            num_decoder_layers (int): Number of sub-decoder-layers in the decoder.
-            dim_feedforward (int): Dimension of the feedforward network model.
-            dropout (float): Dropout value.
-            learning_rate (float): Learning rate for the optimizer.
-            internal_batch_size (int): Batch size to use internally in the training step.
-        """
-        super(CustomTransformer, self).__init__()
-
-        self.encoder = TransformerEncoder(n_antennas=n_antennas,
-                                          n_timesteps=n_timesteps,
-                                          d_model=d_model,
-                                          nhead=nhead,
-                                          num_encoder_layers=num_encoder_layers,
-                                          dim_feedforward=dim_feedforward,
-                                          dropout=dropout,
-                                          position_encoding=position_encoding
-                                          )
+        super().__init__()
+        if isinstance(position_encoding, str):
+            position_encoding = PositionalEncodingType[position_encoding]
+        self.encoder = TransformerEncoder(n_antennas, n_timesteps, d_model, nhead, num_encoder_layers,
+                                          dim_feedforward, dropout, position_encoding)
 
         # Decoder part
         self.decoder_embedding = nn.Linear(dim_position, d_model)
-        decoder_layer = nn.TransformerDecoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+        decoder_layer = IndependentQueryDecoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
                                                    dropout=dropout, batch_first=True)
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
 
@@ -127,150 +108,33 @@ class CustomTransformer(pl.LightningModule):
         self.internal_batch_size_validation = internal_batch_size_validation
         self.loss_fn = torch.nn.MSELoss()
 
-        self.save_hyperparameters(
-            "n_antennas",
-            "n_timesteps",
-            "dim_position",
-            "dim_output",
-            "d_model",
-            "nhead",
-            "num_encoder_layers",
-            "num_decoder_layers",
-            "dim_feedforward",
-            "dropout",
-            "learning_rate",
-            "internal_batch_size_training",
-            "internal_batch_size_validation",
-        )
-
-        self.validation_step_counter = 0
+        self.save_hyperparameters(ignore=["position_encoding"])
+        self.hparams.position_encoding = position_encoding.name
         self.position_encoding = position_encoding
-        # self.logger.log_graph(self, (torch.zeros((1, n_timesteps, n_antennas)), torch.zeros((1, dim_position))))
 
-    def forward(self,
-                batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                batch_idx: int
-                ) -> torch.Tensor:
-        """
-        Forward pass of the transformer.
+    def on_load_checkpoint(self, checkpoint):
+        super().on_load_checkpoint(checkpoint)
+        if "position_encoding" not in checkpoint.get("hyper_parameters", {}):
+            # The archived model saved weights for learned embeddings only.
+            has_embedding = "encoder.positional_encoding.weight" in checkpoint["state_dict"]
+            mode = PositionalEncodingType.learned if has_embedding else PositionalEncodingType.sinusoidal
+            if mode != self.position_encoding:
+                self.encoder.set_position_encoding(mode, self.hparams.n_antennas, self.hparams.d_model)
+                self.encoder.to(self.decoder_embedding.weight)
+            self.position_encoding = mode
+            self.hparams.position_encoding = mode.name
 
-        Args:
-            voltages (torch.Tensor): The input tensor of shape (n_timesteps, n_antennas).
-            positions (torch.Tensor): The query tensor of shape (dim_position).
+    def encode_scene(self, voltages):
+        if voltages.ndim == 4:
+            voltages = voltages.flatten(1, 2)
+        return self.encoder(voltages)
 
-        Returns:
-            torch.Tensor: Output tensor of shape (dim_output).
-        """
-
-        positions, grid_values, voltages = batch
-        positions = positions.squeeze()
-        grid_values = grid_values.squeeze()
-
-        # Encoding
-        positions_latents = self.decoder_embedding(positions).unsqueeze(1)
-        antennas_latents = self.encoder(voltages).expand(positions.shape[0], -1, -1)
-
-        output = self.transformer_decoder(positions_latents, antennas_latents)
-        decoded = self.output_layer(output).squeeze()
-
-        loss = self.loss_fn(decoded.unsqueeze(1), grid_values.unsqueeze(1))
-
-        return decoded
-
-    def training_step(self,
-                      batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                      batch_idx: int
-                      ) -> torch.Tensor:
-        """
-        Training step of the LightningModule.
-
-        Args:
-            batch (Tuple[torch.Tensor, torch.Tensor, torch.Tensor]): A tuple containing the positions, the grid and the
-                sensor samples.
-            batch_idx (int): Index of the batch.
-
-        Returns:
-            torch.Tensor: The loss value.
-        """
-
-        positions, grid_values, voltages = batch
-
-        # subsample randomly
-        indicies = sample_indices(grid_values[0], self.internal_batch_size_training)
-        positions = positions[:, indicies, :]
-        grid_values = grid_values[:, indicies, :]
-
-        # Encoding
-        positions_latents = self.decoder_embedding(positions).permute(1, 0, 2)
-
-        antennas_latents = self.encoder(voltages).expand(self.internal_batch_size_training, -1, -1)
-
-        # print(f"{positions_latents.shape=}")
-        # print(f"{antennas_latents.shape=}")
-
-        output = self.transformer_decoder(positions_latents, antennas_latents)
-        decoded = self.output_layer(output)
-
-        loss = self.loss_fn(decoded, grid_values.permute(1, 0, 2))
-
-        self.log('train_loss', loss)
-        return loss
-
-    def validation_step(self,
-                        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                        batch_idx: int
-                        ) -> torch.Tensor:
-        """
-        Training step of the LightningModule.
-
-        Args:
-            batch (Tuple[torch.Tensor, torch.Tensor, torch.Tensor]): A tuple containing the positions, the grid and the
-                sensor samples.
-            batch_idx (int): Index of the batch.
-
-        Returns:
-            torch.Tensor: The loss value.
-        """
-
-        positions, grid_values, voltages = batch
-
-        # subsample randomly
-        indicies = sample_indices(grid_values[0], self.internal_batch_size_training)
-        positions = positions[:, indicies, :]
-        grid_values = grid_values[:, indicies, :]
-
-        # Encoding
-        positions_latents = self.decoder_embedding(positions).permute(1, 0, 2)
-
-        antennas_latents = self.encoder(voltages).expand(self.internal_batch_size_training, -1, -1)
-
-        output = self.transformer_decoder(positions_latents, antennas_latents)
-        decoded = self.output_layer(output)
-
-        loss = self.loss_fn(decoded, grid_values.permute(1, 0, 2))
-
-        if self.validation_step_counter >= 2:
-            # draw histogram of predicted values and grid values for evaluation
-            self.logger.experiment.add_histogram('actual_values_permittivity', grid_values[:, :, 0], self.global_step)
-            self.logger.experiment.add_histogram('predicted_values_permittivity', decoded[:, :, 0], self.global_step)
-            self.logger.experiment.add_histogram('actual_values_conductivity', grid_values[:, :, 1], self.global_step)
-            self.logger.experiment.add_histogram('predicted_values_conductivity', decoded[:, :, 1], self.global_step)
-            self.logger.experiment.add_histogram('actual_values_sdf', grid_values[:, :, 2], self.global_step)
-            self.logger.experiment.add_histogram('predicted_values_sdf', decoded[:, :, 2], self.global_step)
-
-        self.validation_step_counter += 1
-        self.log('val_loss', loss)
-        return loss
-
-    def configure_optimizers(self):
-        """
-        Choose an optimizer and, optionally, learning rate scheduler.
-        """
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
-        return optimizer
+    def decode_queries(self, positions, memory):
+        queries = self.decoder_embedding(positions)
+        return self.output_layer(self.transformer_decoder(queries, memory))
 
 
-def normal_train():
+def normal_train(data_path=DEFAULT_DATA_PATH):
     data_module = CustomDataset.SensorDataModule(
         data_path,
         batch_size=1,
@@ -278,11 +142,14 @@ def normal_train():
         load_normal_grids=True,
         load_sensor_samples=True,
         load_subsampled_grids=False,
+        split_sensor_samples=True,
         flatten_sensor_samples=False,
     )
 
-    model = CustomTransformer(n_antennas=16 * 5,
-                              n_timesteps=750,
+    metric = data_module.checkpoint_metric()
+    n_antennas, n_directions, n_timesteps = data_module.dataset.sensor_shape
+    model = CustomTransformer(n_antennas=n_antennas * n_directions,
+                              n_timesteps=n_timesteps,
                               dim_position=3,
                               dim_output=3,
                               d_model=1024,
@@ -301,10 +168,10 @@ def normal_train():
 
     PATH = "TransformerPerAntennaAndDir_logs" + f"/{sub_dir}"
 
-    early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=0.00, patience=25, verbose=True, mode="min")
+    early_stop_callback = EarlyStopping(monitor=metric, min_delta=0.00, patience=25, verbose=True, mode="min")
     logger = TensorBoardLogger(save_dir=PATH, version=f"beamforming_{datetime.datetime.now()}")
     checkpoint_callback = ModelCheckpoint(dirpath=f"{PATH}/{logger.version}", save_top_k=1,
-                                          monitor="val_loss")
+                                          monitor=metric)
 
     trainer = pl.Trainer(
         max_epochs=1000,
@@ -318,9 +185,7 @@ def normal_train():
     trainer.fit(model, datamodule=data_module)
 
 
-def render():
-    N_PER_RENDER = 10000
-
+def render(data_path, checkpoint_path, *, visualize=True):
     data_module = CustomDataset.SensorDataModule(
         data_path,
         batch_size=1,
@@ -328,52 +193,11 @@ def render():
         load_normal_grids=True,
         load_sensor_samples=True,
         load_subsampled_grids=False,
+        split_sensor_samples=True,
         flatten_sensor_samples=False
     )
-
-    data_module.setup()
-
-    model = CustomTransformer.load_from_checkpoint(
-        "TransformerPerAntennaAndDir_logs/Learned/beamforming_2024-03-11 14:08:03.883772/epoch=66-step=27135.ckpt"
-    )
-    model = model.cuda()
-
-    model.eval()
-    model.requires_grad_(False)
-
-    batch = next(iter(data_module.test_dataloader()))
-    batch = [b.cuda() for b in batch]
-
-    positions, grid_values, voltages = batch
-
-    output = torch.zeros((positions.shape[0], positions.shape[1], 3)).cuda()
-
-    i = 0
-    while i < positions.shape[1]:
-        j = i + N_PER_RENDER
-        if j > positions.shape[1]:
-            j = positions.shape[1]
-        output[:, i:j, :] = model((positions[:, i:j, :], grid_values[:, i:j, :], voltages), 0)
-        i = j
-        model.zero_grad()
-        print(f"{i / positions.shape[1]:.2f}")
-
-    original_shape = data_module.dataset.grid_original_shape
-
-    output = output[0].view(original_shape)
-
-    ground_truth = batch[1].view(original_shape)
-
-    visualize_sdf(output[:, :, :, 2])
-    visualize_sdf(ground_truth[:, :, :, 2])
-    visualize_permittivity(output[:, :, :, 0])
-    visualize_permittivity(ground_truth[:, :, :, 0])
+    return evaluate_checkpoint(CustomTransformer, data_module, checkpoint_path, visualize=visualize, show_permittivity=True)
 
 
 if __name__ == "__main__":
-    torch.set_float32_matmul_precision('high')
-    data_path = pathlib.Path("new_beamforming_data")
-    # normal_train()
-    render()
-
-# tensorboard --logdir TransformerPerAntennaAndDir_logs
+    run_cli(normal_train, render)

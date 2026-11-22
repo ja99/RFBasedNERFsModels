@@ -1,206 +1,42 @@
 import datetime
-import math
-import pathlib
-from typing import Tuple
 
-from Visualizer import visualize_sdf, visualize_permittivity
-from helpers import sample_indices
-import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 
 import CustomDataset
+from FullyEncodedPerAntenna import FullyEndToEnd as FullField
+from field_training import check_preprocessing, evaluate_checkpoint, run_cli
 
 
-def load_encoder_from_checkpoint(model_path:str,
-                                 model:pl.LightningModule
-                                 )->pl.LightningModule:
-    # Load the state dictionary from the checkpoint
-    checkpoint = torch.load(model_path, map_location=model.device)
-    state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
-
-    # Filter out encoder parameters; this assumes encoder parameters are prefixed with 'encoder.'
-    encoder_dict = {k: v for k, v in state_dict.items() if k.startswith('encoder.')}
-
-    # Update the current model's state dict with encoder parameters
-    model_state_dict = model.state_dict()
-    model_state_dict.update(encoder_dict)
-    model.load_state_dict(model_state_dict)
-
+def load_encoder_from_checkpoint(model_path, model, dataset=None):
+    checkpoint = torch.load(model_path, map_location="cpu", weights_only=True)
+    mode = checkpoint.get("waveform_mode", "legacy_raw")
+    transform = checkpoint.get("preprocessing_id")
+    check_preprocessing(dataset, mode, transform)
+    state = checkpoint.get("state_dict", checkpoint)
+    encoder = {key.removeprefix("encoder."): value for key, value in state.items() if key.startswith("encoder.")}
+    model.encoder.load_state_dict(encoder)
+    model.checkpoint_waveform_mode = mode
+    model.checkpoint_preprocessing_id = transform
+    model.checkpoint_training_protocol = checkpoint.get("training_protocol")
     return model
 
 
-def freeze_encoder(model:pl.LightningModule):
-    # Iterate through all parameters in the encoder and set requires_grad to False
-    for name, param in model.named_parameters():
-        if name.startswith('encoder.'):
-            param.requires_grad = False
+def freeze_encoder(model):
+    model.encoder.requires_grad_(False)
 
 
+class FullyEndToEnd(FullField):
+    """Field decoder trained with a frozen, pretrained antenna encoder."""
 
-class FullyEndToEnd(pl.LightningModule):
-    def __init__(self, n_antennas: int, n_timesteps: int, dim_position: int, dim_output: int,
-                 learning_rate: float = 1e-3, internal_batch_size_training: int = 16,
-                 internal_batch_size_validation: int = 16):
-        super(FullyEndToEnd, self).__init__()
-
-
-        # add each dir individually
-        self.encoder = nn.Sequential(
-            nn.Linear(5*n_timesteps, 8192),
-            nn.ReLU(),
-            nn.Linear(8192, 8192),
-            nn.ReLU(),
-            nn.Linear(8192, 4096),
-            nn.ReLU(),
-            nn.Linear(4096, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, 512),
-            nn.ReLU(),
-        )
+    def on_fit_start(self):
+        super().on_fit_start()
+        freeze_encoder(self)
 
 
-        # concatenate with position
-        self.decoder = nn.Sequential(
-            nn.Linear(dim_position + 8192, 16384),
-            nn.ReLU(),
-            nn.Linear(16384, 8192),
-            nn.ReLU(),
-            nn.Linear(8192, 4096),
-            nn.ReLU(),
-            nn.Linear(4096, 2048),
-            nn.ReLU(),
-            nn.Linear(2048, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, 512),
-            nn.ReLU(),
-            nn.Linear(512, dim_output),
-        )
-
-        self.lr = learning_rate
-        self.internal_batch_size_training = internal_batch_size_training
-        self.internal_batch_size_validation = internal_batch_size_validation
-        self.loss_fn = torch.nn.MSELoss()
-
-        # ToDo: save hyperparameters
-        self.save_hyperparameters(
-            "n_antennas",
-            "n_timesteps",
-            "dim_position",
-            "dim_output",
-            "learning_rate",
-            "internal_batch_size_training",
-            "internal_batch_size_validation",
-        )
-
-        self.validation_step_counter = 0
-        # self.logger.log_graph(self, (torch.zeros((1, n_timesteps, n_antennas)), torch.zeros((1, dim_position))))
-
-    def forward(self,
-                      batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                      batch_idx: int
-                      ) -> torch.Tensor:
-        positions, _, voltages = batch
-
-        positions = positions.squeeze()
-        voltages = voltages.flatten(start_dim=2)
-
-        # Encoding
-        antennas_latents = self.encoder(voltages)
-        antennas_latents = antennas_latents.flatten(start_dim=1)
-        antennas_latents = antennas_latents.expand(positions.shape[0], -1).squeeze()
-
-        # Decoding
-        decoder_input = torch.cat((positions, antennas_latents), dim=-1)
-
-        output = self.decoder(decoder_input)
-
-        return output
-
-    def training_step(self,
-                      batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                      batch_idx: int
-                      ) -> torch.Tensor:
-        positions, grid_values, voltages = batch
-
-        positions = positions.squeeze()
-        grid_values = grid_values.squeeze()
-        voltages = voltages.squeeze()
-
-        # subsample randomly
-        indicies = sample_indices(grid_values, self.internal_batch_size_training)
-        positions = positions[indicies, :]
-        grid_values = grid_values[indicies, :]
-
-        # Encoding
-        voltages = torch.flatten(voltages, start_dim=1).unsqueeze(0)
-        antennas_latents = self.encoder(voltages)
-        antennas_latents = antennas_latents.flatten(start_dim=1)
-        antennas_latents = antennas_latents.expand(self.internal_batch_size_training, -1).squeeze()
-
-        # Decoding
-        decoder_input = torch.cat((positions, antennas_latents), dim=-1)
-
-        output = self.decoder(decoder_input)
-
-        loss = self.loss_fn(output, grid_values)
-
-        self.log('train_loss', loss)
-        return loss
-
-    def validation_step(self,
-                        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                        batch_idx: int
-                        ) -> torch.Tensor:
-        positions, grid_values, voltages = batch
-
-        positions = positions.squeeze()
-        grid_values = grid_values.squeeze()
-        voltages = voltages.squeeze()
-
-        # subsample randomly
-        indicies = sample_indices(grid_values, self.internal_batch_size_training)
-        positions = positions[indicies, :]
-        grid_values = grid_values[indicies, :]
-
-        # Encoding
-        voltages = torch.flatten(voltages, start_dim=1).unsqueeze(0)
-        antennas_latents = self.encoder(voltages)
-        antennas_latents = antennas_latents.flatten(start_dim=1)
-        antennas_latents = antennas_latents.expand(self.internal_batch_size_training, -1).squeeze()
-
-        # Decoding
-        decoder_input = torch.cat((positions, antennas_latents), dim=-1)
-
-        output = self.decoder(decoder_input)
-
-        loss = self.loss_fn(output, grid_values)
-
-        if self.validation_step_counter >= 3:
-            self.logger.experiment.add_histogram('actual_values_permittivity', grid_values[:, 0], self.global_step)
-            self.logger.experiment.add_histogram('predicted_values_permittivity', output[:, 0], self.global_step)
-            self.logger.experiment.add_histogram('actual_values_conductivity', grid_values[:, 1], self.global_step)
-            self.logger.experiment.add_histogram('predicted_values_conductivity', output[:, 1], self.global_step)
-            self.logger.experiment.add_histogram('actual_values_sdf', grid_values[:, 2], self.global_step)
-            self.logger.experiment.add_histogram('predicted_values_sdf', output[:, 2], self.global_step)
-
-        self.validation_step_counter += 1
-        self.log('val_loss', loss)
-        return loss
-
-    def configure_optimizers(self):
-        """
-        Choose an optimizer and, optionally, learning rate scheduler.
-        """
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
-        return optimizer
-
-
-def normal_train():
+def normal_train(data_path, encoder_checkpoint):
     data_module = CustomDataset.SensorDataModule(
         data_path,
         batch_size=1,
@@ -213,9 +49,12 @@ def normal_train():
         load_occupation_grids=False,
     )
 
+    metric = data_module.checkpoint_metric()
+    n_antennas, n_directions, n_timesteps = data_module.dataset.sensor_shape
     model = FullyEndToEnd(
-        n_antennas=16,
-        n_timesteps=750,
+        n_antennas=n_antennas,
+        n_directions=n_directions,
+        n_timesteps=n_timesteps,
         dim_position=3,
         dim_output=3,
         learning_rate=1e-3,
@@ -223,18 +62,14 @@ def normal_train():
         internal_batch_size_validation=64,
     )
 
-    autoencoder_checkpoint = "FullyAutoencoder_logs/beamforming_2024-03-28 18:50:12.425180/epoch=108-step=763.ckpt"
-    model = load_encoder_from_checkpoint(autoencoder_checkpoint, model)
-
-    # Freeze the encoder
-    freeze_encoder(model)
+    load_encoder_from_checkpoint(encoder_checkpoint, model, data_module.dataset)
 
     PATH = "FullyDecoder_logs"
 
-    early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=0.00, patience=25, verbose=True, mode="min")
+    early_stop_callback = EarlyStopping(monitor=metric, min_delta=0.00, patience=25, verbose=True, mode="min")
     logger = TensorBoardLogger(save_dir=PATH, version=f"beamforming_{datetime.datetime.now()}")
     checkpoint_callback = ModelCheckpoint(dirpath=f"{PATH}/{logger.version}", save_top_k=1,
-                                          monitor="val_loss")
+                                          monitor=metric)
 
     trainer = pl.Trainer(
         max_epochs=1000,
@@ -247,9 +82,8 @@ def normal_train():
 
     trainer.fit(model, datamodule=data_module)
 
-def render():
-    N_PER_RENDER = 16384
 
+def render(data_path, checkpoint_path, *, visualize=True):
     data_module = CustomDataset.SensorDataModule(
         data_path,
         batch_size=1,
@@ -261,53 +95,8 @@ def render():
         flatten_sensor_samples=False,
         load_occupation_grids=False,
     )
-    data_module.setup()
+    return evaluate_checkpoint(FullyEndToEnd, data_module, checkpoint_path, visualize=visualize, show_permittivity=True)
 
-    model = FullyEndToEnd.load_from_checkpoint(
-        "FullyDecoder_logs/beamforming_2024-03-28 20:45:32.246514/epoch=11-step=4860.ckpt"
-    )
-    model = model.cuda()
-
-    model.eval()
-    model.requires_grad_(False)
-
-    batch = next(iter(data_module.test_dataloader()))
-    batch = [b.cuda() for b in batch]
-
-    positions, _, voltages = batch
-
-    print(f"positions: {positions.shape}")
-
-    output = torch.zeros((positions.shape[1], 3)).cuda()
-
-    i = 0
-    while i < positions.shape[1]:
-        j = i + N_PER_RENDER
-        if j > positions.shape[1]:
-            j = positions.shape[1]
-        out = model((positions[:, i:j, :], "unneeded grid tensor", voltages), 0)
-        output[i:j, :] = out
-        i = j
-        model.zero_grad()
-        print(f"{i / positions.shape[1]:.2f}")
-
-    original_shape = data_module.dataset.grid_original_shape
-
-    output = output.view(original_shape)
-
-    ground_truth = batch[1].view(original_shape)
-
-    visualize_permittivity(output[:, :, :, 0])
-    visualize_permittivity(ground_truth[:, :, :, 0])
-
-
-
-    visualize_sdf(output[:, :, :, 2], "Predicted SDF")
-    visualize_sdf(ground_truth[:, :, :, 2], "Ground Truth SDF")
 
 if __name__ == "__main__":
-    torch.set_float32_matmul_precision('high')
-    data_path = pathlib.Path("new_beamforming_data")
-    # normal_train()
-    render()
-# tensorboard --logdir FullyDecoder_logs
+    run_cli(normal_train, render, pretrained_encoder=True)

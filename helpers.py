@@ -1,7 +1,3 @@
-import math
-import random
-from dataclasses import dataclass
-
 import torch
 from torch import nn
 
@@ -41,53 +37,54 @@ def create_3d_grid_indices(m:int, n:int, o:int)->torch.Tensor:
     return indices.view(-1, 3)  # Reshape to have each triplet of indices as a row
 
 
-def sample_indices(t: torch.Tensor, n_indices: int, n_bins: int = 10, by_index = None) -> torch.Tensor:
-    bin_edges = torch.linspace(0.0, 1.0, steps=n_bins + 1, device=t.device)
-    indices = []
+def sample_indices(t: torch.Tensor, n_indices: int, n_bins: int = 10, by_index=None) -> torch.Tensor:
+    """Balance the query budget across occupied target bins, without reusing available voxels."""
+    if t.ndim != 2 or min(t.shape) == 0 or n_bins < 1 or n_indices < 1:
+        raise ValueError("Expected a nonempty [voxel, channel] tensor and positive sample/bin counts")
 
-    if by_index is None:
-        # Randomly choose a dimension to sample from
-        dim_to_sample = random.choice([0, 1, 2])
+    n_voxels, n_channels = t.shape
+    rounds, remaining = divmod(n_indices, n_voxels)
+    samples = [torch.randperm(n_voxels, device=t.device) for _ in range(rounds)]
+    if remaining:
+        channel = torch.randint(n_channels, ()).item() if by_index is None else by_index
+        edges = torch.linspace(0, 1, n_bins + 1, dtype=t.dtype, device=t.device)
+        bins = torch.bucketize(t[:, channel].contiguous(), edges[1:-1], right=True)
+        capacities = torch.bincount(bins, minlength=n_bins).tolist()
+        # Randomize who gets the final, indivisible part of the budget.
+        active = [b for b in torch.randperm(n_bins).tolist() if capacities[b]]
+        quotas = [0] * n_bins
+        while remaining:
+            share, extra = divmod(remaining, len(active))
+            for i, b in enumerate(active):
+                take = min(share + (i < extra), capacities[b] - quotas[b])
+                quotas[b] += take
+                remaining -= take
+            active = [b for b in active if quotas[b] < capacities[b]]
+
+        for b, count in enumerate(quotas):
+            if count:
+                members = (bins == b).nonzero(as_tuple=True)[0]
+                order = torch.randperm(len(members), device=t.device)[:count]
+                samples.append(members[order])
+
+    indices = torch.cat(samples)
+    return indices[torch.randperm(n_indices, device=t.device)]
+
+
+def uniform_query_indices(n_scenes, n_voxels, n_queries, device, *, seed=None):
+    """Draw once from each of evenly spaced voxel ranges per scene.
+
+    Splitting the flattened volume into disjoint ranges covers its depth and keeps
+    memory proportional to the query budget. A local generator leaves training RNG
+    state untouched when validation repeats on the same ordered batches.
+    """
+    if min(n_scenes, n_voxels, n_queries) < 1:
+        raise ValueError("Scene, voxel and query counts must be positive")
+    count = min(n_queries, n_voxels)
+    bounds = torch.arange(count + 1, dtype=torch.long, device=device) * n_voxels // count
+    if seed is None:
+        offsets = torch.rand(n_scenes, count, device=device)
     else:
-        dim_to_sample = by_index
-
-    # Assign each entry to a bin
-    bins = torch.bucketize(t[:, dim_to_sample].contiguous(), bin_edges, right=True) - 1
-    bins[bins == n_bins] = n_bins - 1  # Adjust for the rightmost edge
-
-    n_per_bin = max(1, math.ceil(n_indices / n_bins))  # Ensure at least one sample per bin
-
-    # Calculate bin frequencies
-    bin_counts = torch.bincount(bins, minlength=n_bins)
-    bin_frequencies = bin_counts.float() / bin_counts.sum()
-
-    # Inverse frequencies for sampling from less common bins
-    inverse_frequencies = 1.0 / (bin_frequencies + 1e-6)  # Avoid division by zero
-    inverse_frequencies[bin_frequencies == 0] = 0  # Do not sample from empty bins
-    sampling_weights = inverse_frequencies / inverse_frequencies.sum()
-
-    for i in range(n_bins):
-        bin_indices = torch.where(bins == i)[0]
-        if 0 < len(bin_indices):
-            selected = bin_indices[torch.randint(0, len(bin_indices), size=(n_per_bin,))]
-            indices.append(selected)
-        else:
-            # Sample from less common bins based on inverse frequencies
-            choice_bins = torch.multinomial(sampling_weights, n_per_bin, replacement=True)
-            choice_indices = []
-            for choice_bin in choice_bins:
-                choice_bin_indices = torch.where(bins == choice_bin)[0]
-                # Randomly choose an index from the selected bin
-                if len(choice_bin_indices) > 0:
-                    choice_index = choice_bin_indices[torch.randint(0, len(choice_bin_indices), (1,))]
-                    choice_indices.append(choice_index)
-            if choice_indices:
-                indices.append(torch.cat(choice_indices))
-
-    indices = torch.cat(indices) if indices else torch.tensor([], device=t.device, dtype=torch.long)
-
-    # Shuffle the final indices to avoid ordering by bin
-    if len(indices) > 0:
-        indices = indices[torch.randperm(len(indices))]
-
-    return indices[:n_indices]  # Ensure we return exactly n_indices
+        rng = torch.Generator(device="cpu").manual_seed(seed)
+        offsets = torch.rand(n_scenes, count, device="cpu", generator=rng).to(device)
+    return bounds[:-1] + (offsets * bounds.diff()).long().minimum(bounds.diff() - 1)

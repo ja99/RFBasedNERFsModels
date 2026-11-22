@@ -1,169 +1,112 @@
-import datetime
-import pathlib
-import random
-import time
-from pprint import pprint
-from typing import Tuple, Any, Dict, List
+import math
+from pathlib import Path
+import warnings
 
-from pytorch_lightning.utilities.types import STEP_OUTPUT
-
-from helpers import *
-
-import optuna
-from optuna.integration import PyTorchLightningPruningCallback
 import pytorch_lightning as pl
-import numpy as np
 import torch
-from tqdm import tqdm
 from torch import nn
-from siren_pytorch import SirenNet
-import plotly.express as px
-from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import random_split, DataLoader, Dataset
+from torch.utils.data import Dataset, Subset
 import torch.nn.functional as F
+
+from CustomDataset import SensorDataset as Scenes, SensorDataModule as SceneDataModule
+from field_training import DEFAULT_DATA_PATH, SensorModel, run_cli
 
 
 class SensorDataset(Dataset):
-    def __init__(self, data_path: pathlib.Path):
-        self.grids = [np.load(path) for path in data_path.glob("*/grid.npy")]
-        self.sensor_samples = [np.load(path) for path in data_path.glob("*/sensor_samples.npy")]
-
-        self.grid_size = len(torch.tensor(self.grids[0]).flatten())
-        self.sensor_samples_size = len(torch.tensor(self.sensor_samples[0]).flatten())
-
-        # Normalizing the values between 0 and 1 for each of the 3 columns individually
-        min_vals = self.grids.min(axis=0)
-        max_vals = self.grids.max(axis=0)
-        self.grids = (self.grids - min_vals) / (max_vals - min_vals)
-
-        # Normalizing the values between 0 and 1
-        min_vals = self.sensor_samples.min(axis=0)
-        max_vals = self.sensor_samples.max(axis=0)
-        self.sensor_samples = (self.sensor_samples - min_vals) / (max_vals - min_vals)
+    """Choose both members of a similarity pair from the same scene split."""
+    def __init__(self, data_path, *, deterministic=False):
+        self.scenes = data_path
+        if isinstance(data_path, (str, Path)):
+            self.scenes = Scenes(data_path, load_normal_grids=True)
+        source = self.scenes.dataset if isinstance(self.scenes, Subset) else self.scenes
+        self.waveform_mode = source.waveform_mode
+        self.preprocessing_id = source.preprocessing_id
+        self.training_protocol = source.training_protocol
+        self.grid_size = math.prod(source.grid_original_shape)
+        self.sensor_samples_size = math.prod(source.sensor_shape)
+        self.deterministic = deterministic
 
     def __len__(self):
-        return len(self.grids)
+        return len(self.scenes) if len(self.scenes) >= 2 else 0
 
-    def __getitem__(
-            self,
-            idx: int
-    ) -> dict[str, torch.Tensor]:
-        #ToDo: results in data leakage, fix this
-        rand_other_idx = random.randint(0, len(self.grids) - 1)
-
-        return {
-            "grid_a": torch.tensor(self.grids[idx]).flatten().float(),
-            "grid_b": torch.tensor(self.grids[rand_other_idx]).flatten().float(),
-            "sensor_samples_a": torch.tensor(self.sensor_samples[idx]).flatten().float(),
-            "sensor_samples_b": torch.tensor(self.sensor_samples[rand_other_idx]).flatten().float(),
-        }
+    def __getitem__(self, idx):
+        if not 0 <= idx < len(self):
+            raise IndexError(idx)
+        offset = 1
+        if not self.deterministic:
+            offset = torch.randint(1, len(self.scenes), ()).item()
+        a, va = self.scenes[idx]
+        b, vb = self.scenes[(idx + offset) % len(self.scenes)]
+        return {"grid_a": a.flatten(), "grid_b": b.flatten(),
+                "sensor_samples_a": va.flatten(), "sensor_samples_b": vb.flatten()}
 
 
-
-
-class SensorDataModule(pl.LightningDataModule):
-    def __init__(self, data_path: pathlib.Path, batch_size: int = 1024):
-        super().__init__()
-        self.data_path = data_path
-        self.batch_size = batch_size
-        self.dataset = SensorDataset(self.data_path)
-
-    def prepare_data(self):
-        # Load the data once and only once (no state or downloads here)
-        ...
+class SensorDataModule(SceneDataModule):
+    def __init__(self, data_path, batch_size=4):
+        super().__init__(data_path, batch_size=batch_size, load_normal_grids=True, load_subsampled_grids=False)
 
     def setup(self, stage=None):
-        # Split dataset
-        self.train_dataset, self.val_dataset = torch.utils.data.random_split(self.dataset,
-                                                                             [int(len(self.dataset) * 0.8),
-                                                                              len(self.dataset) - int(
-                                                                                  len(self.dataset) * 0.8)])
+        if hasattr(self, "train_dataset"):
+            return
+        super().setup(stage)
+        if len(self.val_dataset) == 1:
+            warnings.warn("Similarity validation requires two distinct scenes. This split has no validation pairs.",
+                          UserWarning, stacklevel=2)
+        self.train_dataset = SensorDataset(self.train_dataset)
+        self.val_dataset = SensorDataset(self.val_dataset, deterministic=True)
+        self.test_dataset = SensorDataset(self.test_dataset, deterministic=True)
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=4)
+        if len(self.train_dataset) == 0:
+            raise ValueError("Similarity training requires at least two distinct training scenes")
+        return super().train_dataloader()
 
-    def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=4)
 
-
-# Define the LightningModule
-class EncoderModule(pl.LightningModule):
-    def __init__(self,
-                 sensor_samples_size: int = 1000,  # n_antenna*n_sample
-                 dims_hidden: List[int] = [256],
-                 activation: nn.Module = None,
-                 learning_rate: float = 1e-6,
-                 ):
+class EncoderModule(SensorModel):
+    def __init__(self, sensor_samples_size: int = 1000, dims_hidden=(256,),
+                 activation=nn.Tanh, learning_rate: float = 1e-6):
         super().__init__()
+        if isinstance(activation, str):
+            activation = getattr(nn, activation)
+        self.save_hyperparameters(ignore=["activation"])
+        self.hparams.activation = activation.__name__
 
         layers = []
-        layers.append(nn.Linear(sensor_samples_size, dims_hidden[0]))
-        layers.append(activation())
-        for i in range(1, len(dims_hidden)):
-            layers.append(nn.Linear(dims_hidden[i-1], dims_hidden[i]))
-            layers.append(activation())
-
+        width = sensor_samples_size
+        for next_width in dims_hidden:
+            layers.extend([nn.Linear(width, next_width), activation()])
+            width = next_width
         self.encode = nn.Sequential(*layers)
-
-
-        self.loss_fn = torch.nn.MSELoss()
+        self.loss_fn = nn.MSELoss()
         self.learning_rate = learning_rate
 
-    def forward(self,
-                inputs: torch.Tensor,  # [B, n_antennas*n_samples]
-                ) -> torch.Tensor:  # [B, dims_hidden[-1]]
-        latent = self.encode(inputs)
-        return latent
+    def forward(self, inputs):
+        return self.encode(inputs)
 
+    def _loss(self, batch):
+        latent_a = self(batch["sensor_samples_a"])
+        latent_b = self(batch["sensor_samples_b"])
+        return self.loss_fn(F.cosine_similarity(latent_a, latent_b, dim=1),
+                            F.cosine_similarity(batch["grid_a"], batch["grid_b"], dim=1))
 
-    def training_step(self,
-                      inputs: Dict[str, torch.Tensor],
-                      batch_idx: int
-                      ):
-        grid_a, grid_b, sensor_samples_a, sensor_samples_b = inputs["grid_a"], inputs["grid_b"], inputs["sensor_samples_a"], inputs["sensor_samples_b"]
-
-        latent_a = self(sensor_samples_a)
-        latent_b = self(sensor_samples_b)
-
-        cosine_similarity_latents = F.cosine_similarity(latent_a, latent_b, dim=1)
-        cosine_similarity_grids = F.cosine_similarity(grid_a, grid_b, dim=1)
-
-        loss = self.loss_fn(cosine_similarity_latents, cosine_similarity_grids)
-        self.log('train_loss', loss)
+    def training_step(self, inputs, batch_idx):
+        loss = self._loss(inputs)
+        self.log("train_loss", loss)
         return loss
 
-
-
-    def validation_step(self,
-                      inputs: Dict[str, torch.Tensor],
-                      batch_idx: int
-                      ):
-        grid_a, grid_b, sensor_samples_a, sensor_samples_b = inputs["grid_a"], inputs["grid_b"], inputs["sensor_samples_a"], inputs["sensor_samples_b"]
-
-        latent_a = self(sensor_samples_a)
-        latent_b = self(sensor_samples_b)
-
-        cosine_similarity_latents = F.cosine_similarity(latent_a, latent_b, dim=1)
-        cosine_similarity_grids = F.cosine_similarity(grid_a, grid_b, dim=1)
-
-        loss = self.loss_fn(cosine_similarity_latents, cosine_similarity_grids)
-        self.log('val_loss', loss)
+    def validation_step(self, inputs, batch_idx):
+        loss = self._loss(inputs)
+        self.log("val_loss", loss)
         return loss
-
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam([*self.encode.parameters()], lr=self.learning_rate)
-        return optimizer
+        return torch.optim.Adam(self.encode.parameters(), lr=self.learning_rate)
 
 
-
-
-
-
-def normal_train():
-    data_module = SensorDataModule(data_path, batch_size=64)
+def normal_train(data_path=DEFAULT_DATA_PATH):
+    data_module = SensorDataModule(data_path)
     model = EncoderModule(
-        sensor_samples_size=data_module.dataset.sensor_samples_size,
+        sensor_samples_size=math.prod(data_module.dataset.sensor_shape),
         dims_hidden=[2048, 512],
         activation=nn.Tanh,
         learning_rate=1e-6
@@ -177,9 +120,5 @@ def normal_train():
     trainer.fit(model, datamodule=data_module)
 
 
-
 if __name__ == "__main__":
-    data_path = pathlib.Path("data/new_data")
-    normal_train()
-
-# command to start tensorboard: tensorboard --logdir=runs
+    run_cli(normal_train)

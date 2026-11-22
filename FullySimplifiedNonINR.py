@@ -1,39 +1,35 @@
 import datetime
 import math
-import pathlib
-from typing import Tuple
-from icecream import ic
-from Visualizer import visualize_sdf
-from helpers import sample_indices
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+
+from torch import nn
+from torch.nn import functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 
 import CustomDataset
+from field_training import DEFAULT_DATA_PATH, SensorModel, evaluate_checkpoint, run_cli
 
 
-class FullyEndToEnd(pl.LightningModule):
+def upsample_sdf(coarse, spatial_shape, stride):
+    """Interpolate at original voxel coordinates and extend the last coarse value to each outer boundary."""
+    coarse_shape = tuple((size - 1) // stride + 1 for size in spatial_shape)
+    extent = tuple((size - 1) * stride + 1 for size in coarse_shape)
+    values = coarse.reshape(1, 1, *coarse_shape)
+    sampled = F.interpolate(values, size=extent, mode="trilinear", align_corners=True)
+    tail_x, tail_y, tail_z = (size - sampled_size for size, sampled_size in zip(spatial_shape, extent))
+    full = F.pad(sampled, (0, tail_z, 0, tail_y, 0, tail_x), mode="replicate")
+    return full[0, 0].unsqueeze(-1)
+
+
+class FullyEndToEnd(SensorModel):
     def __init__(self, n_antennas: int, n_timesteps: int, dim_position: int, dim_output: int,
                  learning_rate: float = 1e-3, internal_batch_size_training: int = 16,
-                 internal_batch_size_validation: int = 16):
-        super(FullyEndToEnd, self).__init__()
-
-        # encoding per t?
-        # encoding per antenna?
-        # encoding per t and antenna?
-        # encoding per direction?
-        # adding latents up?
-
-        # in size: B x 16 x 5 x 750
-        # in size: B x n_antennas x dir x timestep
-
-        # add each dir individually
+                 internal_batch_size_validation: int = 16, n_directions: int = 5, output_relu: bool = False,
+                 native_stride: int = 5):
+        super().__init__()
         self.encoder = nn.Sequential(
-            nn.Linear(5 * n_timesteps, 8192),
+            nn.Linear(n_directions * n_timesteps, 8192),
             nn.ReLU(),
             nn.Linear(8192, 8192),
             nn.ReLU(),
@@ -45,108 +41,52 @@ class FullyEndToEnd(pl.LightningModule):
             nn.ReLU(),
         )
 
-        # concatenate with position
         self.decoder = nn.Sequential(
-            nn.Linear(8192, 8192),
+            nn.Linear(n_antennas * 512, 8192),
             nn.ReLU(),
             nn.Linear(8192, 16384),
             nn.ReLU(),
             nn.Linear(16384, 16384),
             nn.ReLU(),
             nn.Linear(16384, dim_output),
-            nn.ReLU(),
+            nn.ReLU() if output_relu else nn.Identity(),
         )
 
         self.lr = learning_rate
-        self.loss_fn = torch.nn.MSELoss()
+        self.native_stride = native_stride
+        self.internal_batch_size_training = internal_batch_size_training
+        self.internal_batch_size_validation = internal_batch_size_validation
+        self.loss_fn = nn.MSELoss()
+        self.save_hyperparameters()
 
-        # ToDo: save hyperparameters
-        self.save_hyperparameters(
-            "n_antennas",
-            "n_timesteps",
-            "dim_position",
-            "dim_output",
-            "learning_rate",
-        )
+    def forward(self, batch, batch_idx=0):
+        _, voltages = batch
+        latent = self.encoder(voltages.flatten(start_dim=2)).flatten(start_dim=1)
+        return self.decoder(latent)
 
-        self.validation_step_counter = 0
-        # self.logger.log_graph(self, (torch.zeros((1, n_timesteps, n_antennas)), torch.zeros((1, dim_position))))
+    def predict_volume(self, batch, spatial_shape, chunk_size=None):
+        _, voltages = batch
+        coarse = self((None, voltages.to(self.device))).cpu()
+        return upsample_sdf(coarse, spatial_shape, self.native_stride)
 
-    def forward(self,
-                batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                batch_idx: int
-                ) -> torch.Tensor:
-        # Encoding
-        grid_values, voltages = batch
-
-        # Encoding
-        voltages = torch.flatten(voltages, start_dim=2)
-
-        antennas_latents = self.encoder(voltages)
-        antennas_latents = antennas_latents.flatten(start_dim=1)
-
-        # Decoding
-        output = self.decoder(antennas_latents)
-
-        loss = self.loss_fn(output, grid_values[:, :, 2])
-        print(loss)
-
-        return output
-
-    def training_step(self,
-                      batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                      batch_idx: int
-                      ) -> torch.Tensor:
-        grid_values, voltages = batch
-
-        # Encoding
-        voltages = torch.flatten(voltages, start_dim=2)
-
-        antennas_latents = self.encoder(voltages)
-        antennas_latents = antennas_latents.flatten(start_dim=1)
-
-        # Decoding
-        output = self.decoder(antennas_latents)
-
-        loss = self.loss_fn(output, grid_values[:, :, 2])
-
-        self.log('train_loss', loss)
+    def training_step(self, batch, batch_idx):
+        loss = self.loss_fn(self(batch), batch[0][..., 2])
+        self.log("train_loss", loss)
         return loss
 
-    def validation_step(self,
-                        batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                        batch_idx: int
-                        ) -> torch.Tensor:
-        grid_values, voltages = batch
-
-        # Encoding
-        voltages = torch.flatten(voltages, start_dim=2)
-
-        antennas_latents = self.encoder(voltages)
-        antennas_latents = antennas_latents.flatten(start_dim=1)
-
-        # Decoding
-        output = self.decoder(antennas_latents)
-
-        loss = self.loss_fn(output, grid_values[:, :, 2])
-
-        if self.validation_step_counter >= 3:
-            self.logger.experiment.add_histogram('actual_values_sdf', grid_values[:, :, 2], self.global_step)
-            self.logger.experiment.add_histogram('predicted_values_sdf', output, self.global_step)
-
-        self.validation_step_counter += 1
-        self.log('val_loss', loss)
+    def validation_step(self, batch, batch_idx):
+        target = batch[0][..., 2]
+        output = self(batch)
+        loss = self.loss_fn(output, target)
+        log = getattr(getattr(self.logger, "experiment", None), "add_histogram", None)
+        if batch_idx == 0 and log is not None:
+            log("actual_values_sdf", target, self.global_step)
+            log("predicted_values_sdf", output, self.global_step)
+        self.log("val_loss", loss)
         return loss
 
-    def configure_optimizers(self):
-        """
-        Choose an optimizer and, optionally, learning rate scheduler.
-        """
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
-        return optimizer
 
-
-def normal_train():
+def normal_train(data_path=DEFAULT_DATA_PATH):
     data_module = CustomDataset.SensorDataModule(
         data_path,
         batch_size=64,
@@ -159,26 +99,26 @@ def normal_train():
         load_occupation_grids=False,
     )
 
-    data_module.setup()
+    output_size = math.prod(data_module.dataset.grid_original_shape[:3])
 
-    batch = next(iter(data_module.test_dataloader()))
-
-    output_size = batch[0].shape[-2]
-
+    metric = data_module.checkpoint_metric()
+    n_antennas, n_directions, n_timesteps = data_module.dataset.sensor_shape
     model = FullyEndToEnd(
-        n_antennas=16,
-        n_timesteps=750,
+        n_antennas=n_antennas,
+        n_directions=n_directions,
+        n_timesteps=n_timesteps,
         dim_position=3,
         dim_output=output_size,
+        native_stride=data_module.dataset.subsample_stride,
         learning_rate=1e-5,
     )
 
     PATH = "FullySimplifiedNonINR_logs"
 
-    early_stop_callback = EarlyStopping(monitor="val_loss", min_delta=0.00, patience=25, verbose=True, mode="min")
+    early_stop_callback = EarlyStopping(monitor=metric, min_delta=0.00, patience=25, verbose=True, mode="min")
     logger = TensorBoardLogger(save_dir=PATH, version=f"beamforming_{datetime.datetime.now()}")
     checkpoint_callback = ModelCheckpoint(dirpath=f"{PATH}/{logger.version}", save_top_k=1,
-                                          monitor="val_loss")
+                                          monitor=metric)
 
     trainer = pl.Trainer(
         max_epochs=1000,
@@ -192,49 +132,21 @@ def normal_train():
     trainer.fit(model, datamodule=data_module)
 
 
-def render():
+def render(data_path, checkpoint_path, *, visualize=True):
     data_module = CustomDataset.SensorDataModule(
         data_path,
         batch_size=1,
         load_positions=False,
-        load_normal_grids=False,
-        load_subsampled_grids=True,
+        load_normal_grids=True,
+        load_subsampled_grids=False,
         load_sensor_samples=True,
         split_sensor_samples=True,
         flatten_sensor_samples=False,
         load_occupation_grids=False,
     )
-
-    data_module.setup()
-
-    model = FullyEndToEnd.load_from_checkpoint(
-        "FullySimplifiedNonINR_logs/beamforming_2024-03-13 11:58:23.291125/epoch=74-step=525.ckpt"
-    )
-    model = model.cuda()
-
-    model.eval()
-
-    batch = next(iter(data_module.test_dataloader()))
-    batch = [b.cuda() for b in batch]
-
-    output = model(batch, 0)
-
-    original_shape = data_module.dataset.grid_original_shape[:-1]
-
-    output = output[0].view(original_shape)
-
-    ground_truth = batch[0][:, :, 2].view(original_shape)
-
-    visualize_sdf(output)
-    visualize_sdf(ground_truth)
-
-
-
+    return evaluate_checkpoint(FullyEndToEnd, data_module, checkpoint_path, visualize=visualize,
+                               show_permittivity=False)
 
 
 if __name__ == "__main__":
-    torch.set_float32_matmul_precision('high')
-    data_path = pathlib.Path("new_beamforming_data")
-    # normal_train()
-    render()
-# tensorboard --logdir FullySimplifiedNonINR_logs
+    run_cli(normal_train, render)
