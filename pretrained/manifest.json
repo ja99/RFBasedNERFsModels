@@ -1,0 +1,37 @@
+{
+  "release": "phantom-benchmark-v1",
+  "assets": {
+    "dielectric-kernel.npz": {
+      "sha256": "ae94d928d5e90bd370300ad73e35604ce3020590ca8ff38a16f9b27ce13cf8d5",
+      "bytes": 10790229
+    },
+    "dielectric-material.npz": {
+      "sha256": "86364ea9a07adef63e3cf2615756c36cdd7bd2ebd74a8758144ba4388ac6f3b0",
+      "bytes": 3619016
+    },
+    "conductive-kernel.npz": {
+      "sha256": "4e40c06983d1ba9cf30f4d260dec4685c4c386ed17d3132a134156fb6731df67",
+      "bytes": 4188318
+    },
+    "conductive-material.npz": {
+      "sha256": "911784a49d8fdf33929c61b5be956a482c9ee5ad5898d9f57bc59d1f4e0dff97",
+      "bytes": 3478453
+    },
+    "mixed-volume.pt": {
+      "sha256": "449406d32e8bc7e6cd1cb512b704d27296a89f4c10f4f350bce2dbfaae526944",
+      "bytes": 17604197
+    },
+    "mixed-set.pt": {
+      "sha256": "3d3b66018b5dd65452d93776c0835427cac61b3103499d7d9cd7b446fd0d2f4e",
+      "bytes": 10192965
+    },
+    "broadside-kernel.npz": {
+      "sha256": "7b1ab8a8c5808d352768bff85313cbed5331fb70ed58beb34035369270964bbf",
+      "bytes": 962164
+    },
+    "metre-single-shot.npz": {
+      "sha256": "2d0ecd5e0a3c22be386440511c54cf159af5cf6fbf1149f541fbb09a590137f1",
+      "bytes": 18960745
+    }
+  }
+}
