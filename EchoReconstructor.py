@@ -322,6 +322,7 @@ def score(model, features, truth, xyz, scene_ids, batch_size, split="test"):
                        sdf_mae_cells=error / xyz.size(0), center_error_cells=errors[j] if occupied and predicted else None)
             if split == "test":
                 row.update(component_counts(predictions[j], actual[j]))
+                row["physical_instances"] = component_counts(predictions[j], actual[j], connectivity=26)
             rows.append(row)
     total_union = sum(row["occupied_union"] for row in rows)
     center_errors = [row["center_error_cells"] for row in rows if row["center_error_cells"] is not None]
@@ -333,16 +334,25 @@ def score(model, features, truth, xyz, scene_ids, batch_size, split="test"):
         "mean_sdf_mae_cells": sum(row["sdf_mae_cells"] for row in rows) / len(rows),
     }
     if split == "test":
-        summary.update(summarize_components(rows))
-        summary["component_connectivity"] = 6
+        def counts(group):
+            face = summarize_components(group)
+            physical = summarize_components([r["physical_instances"] for r in group])
+            return dict(**face, component_connectivity=6,
+                        component_count_accuracy=face["correct_component_count_scenes"]/len(group),
+                        physical_instances=dict(connectivity=26, **physical,
+                                                count_accuracy=physical["correct_component_count_scenes"]/len(group)))
+
+        summary.update(counts(rows))
         summary["component_iou_thresholds"] = [.25, .50]
-        groups = {}
-        for row in rows:
-            groups.setdefault(row["target_components"], []).append(row)
-        summary["by_target_components"] = {
-            str(k): {"scenes": len(group), "mean_scene_iou": sum(row["occupancy_iou"] for row in group) / len(group),
-                     **summarize_components(group)} for k, group in sorted(groups.items())
-        }
+        for name, key in [("by_target_components", None), ("by_target_instances", "physical_instances")]:
+            groups = {}
+            for row in rows:
+                group_count = (row[key] if key else row)["target_components"]
+                groups.setdefault(group_count, []).append(row)
+            summary[name] = {
+                str(k): {"scenes": len(group), "mean_scene_iou": sum(r["occupancy_iou"] for r in group)/len(group),
+                         **counts(group)} for k, group in sorted(groups.items())
+            }
     return {"scenes": rows, "summary": summary}
 
 

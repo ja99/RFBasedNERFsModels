@@ -66,6 +66,8 @@ class EchoReconstructionTests(unittest.TestCase):
         report = score(model, features, truth, coordinates(shape, "cpu"), ["a", "b"], 2)
         self.assertEqual(report["summary"]["matched_components_iou50"], 4)
         self.assertEqual(report["summary"]["by_target_components"]["2"]["scenes"], 2)
+        self.assertEqual(report["summary"]["physical_instances"]["matched_components_iou50"], 4)
+        self.assertEqual(report["summary"]["by_target_instances"]["2"]["physical_instances"]["count_accuracy"], 1.)
         self.assertEqual(report["summary"]["mean_scene_iou"], 1.)
         model.loss(features, truth - .2).backward()
         self.assertGreater(model.fine[-1].weight.grad.abs().sum(), 0.)
