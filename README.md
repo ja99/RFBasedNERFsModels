@@ -2,6 +2,35 @@
 
 The simulator writes five steered shots and a matched empty-scene recording. The models take the signed difference between those recordings and predict fields on the voxel grid. The commands below assume the simulator and models are sibling checkouts and Python 3.12 is active.
 
+## Run a trained reconstruction
+
+The example contains two RF recordings and the array calibration. It is the second previously unseen scene in the low-loss test set. From this directory, run the following commands with Python 3.12.
+
+```bash
+python -m pip install -r requirements.txt
+python Reconstruct.py examples/dielectric reconstruction.npz --device cpu
+python -c "import numpy as np; a=np.load('reconstruction.npz'); print(a.files, a['occupied'].sum())"
+```
+
+The first run fetches the signed-distance and material model weights from the release and verifies their SHA-256 digests. Use `--weights-dir /workspace/rf-models` to keep a local copy on a Runpod volume. The output contains the signed distance in grid cells, occupancy, relative permittivity, conductivity in S/m, cell size in metres and grid origin. Negative distances are inside the predicted object. [Trained weights](https://github.com/ja99/RFBasedNERFsModels/releases/tag/phantom-benchmark-v1)
+
+For one homogeneous sphere or rotated box, `--refine` fits both candidate shapes and their material against the measured voltages. Install the sibling simulator requirements, then run the following command on a CUDA machine with `nvcc` installed. The CPU solver also supports refinement with a C++17/OpenMP compiler.
+
+```bash
+python -m pip install -r ../RFBasedNERFsSimulator/requirements.txt
+python Reconstruct.py examples/dielectric refined.npz --refine --device cuda
+```
+
+For a low-loss scene containing one or two separated objects, `--mode mixed` runs a volume decoder trained on both counts. It exports geometry. Use `--mode mixed --refine` to initialize up to two individual masks from RF and fit their joint waveform. The output includes reconstructed material fields and individual masks. The standalone two-slot estimator also exposes its masks through `EchoSet.py infer --instances`. Each model checks that the supplied array, pulse, sample timing and empty reference use its fitted calibration. For the metre-scale, single-excitation protocol, use its separate arrival-time estimator. The metre example is the second sealed measurement, a rotated box reconstructed at IoU 0.585 and center error 1.28 cm. The first measurement is preserved in `examples/metre-miss`. Its 23.46 cm center error produced zero overlap. Both examples contain only measured and empty waveforms, IDs and calibration. The estimator exports the predicted occupied volume and estimated center on the 8 mm lattice.
+
+```bash
+python Reconstruct.py examples/metre metre-reconstruction.npz --mode metre
+```
+
+New measurements use a directory containing `sensor_samples.npy`, `empty_sensor_samples.npy` and `acquisition.json`. For the compact protocol the arrays are ordered `[16 receivers, 5 shots, 128 samples]`. The two recordings must share the same acquisition settings. The example runs without any voxel labels. [Experiment design, scores and limitations](https://github.com/ja99/MasterThesisLatex/blob/main/diagnostics/benchmark_results.md)
+
+When a laboratory setup provides an independently known empty forward region, `--clearance-cells N` fits the reference gain independently for each receiver using only samples that precede the earliest possible object return. The compact benchmark guarantees two cells of clearance. The default uses the supplied empty recording directly. To export a corrected reference and its diagnostics, run `python CalibrateReference.py INPUT CALIBRATED --clearance-cells N`.
+
 ## Reproduce the small CPU experiment
 
 Run these commands from the models directory. Choose a new data directory for each simulation. On a pod, set `RF_RUN` to a directory on its mounted volume to keep simulation data, the archive and checkpoints together.
@@ -53,4 +82,4 @@ The field solver, waveform steering and voxel-boundary fixes take effect during 
 
 For historical raw scene folders, select `--raw` explicitly or supply an empty recording acquired with the same settings via `--empty-reference`. A shared reference for a scene with recorded metadata needs matching `acquisition.json` alongside the reference. Declare single-shot arrays with `--single-shot`, and verified antenna-major five-shot packed arrays with `--sensor-layout packed-antenna-direction`. A direction-first 3-D array uses `--sensor-layout direction,antenna,timestep`. Use `--crop-x-end 15` only to reproduce the additional old x crop. Converting writes a new `dataset.hdf5` in that directory, so keep the historical archive separately if it is needed for an old checkpoint.
 
-Historical checkpoints need their original raw archive. For a FullyINR checkpoint missing its architecture metadata, loading recovers layer widths from the weights and assumes the thesis training script's GELU activation. Supply `--activation Tanh` at evaluation or rendering if that run used Tanh. New checkpoints trained on empty-subtracted signals require compatible calibrated data. The historical voxel-sampling and RF probes remain reproducible against the archived Git revisions in the [thesis audit notebook](../MasterThesisLatex/diagnostics/rf_reconstruction_audit.ipynb).
+Historical checkpoints need their original raw archive. For a FullyINR checkpoint missing its architecture metadata, loading recovers layer widths from the weights and assumes the thesis training script's GELU activation. Supply `--activation Tanh` at evaluation or rendering if that run used Tanh. New checkpoints trained on empty-subtracted signals require compatible calibrated data. The historical voxel-sampling and RF probes remain reproducible against the archived Git revisions in the [thesis audit notebook](https://github.com/ja99/MasterThesisLatex/blob/main/diagnostics/rf_reconstruction_audit.ipynb).
