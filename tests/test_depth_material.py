@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 import h5py
 import numpy as np
@@ -100,6 +101,21 @@ class DepthMaterialTests(unittest.TestCase):
                 np.testing.assert_allclose(result['permittivity'][~mask], 1.)
                 np.testing.assert_array_equal(result['geometry_beam_indices'], [0])
                 np.testing.assert_array_equal(result['material_beam_indices'], [0])
+            # Correcting visible geometry must also move the material-field boundary.
+            free, hit = np.zeros_like(mask), np.zeros_like(mask)
+            free[tuple(np.argwhere(mask)[0])] = True
+            hit[tuple(np.argwhere(~mask)[0])] = True
+            with patch('DepthGeometry.registered_camera') as optics:
+                optics.return_value.observations.return_value = (free, hit)
+                reconstruct(scene, volume, depth_geometry=True, depth_tolerance_mm=3, **options)
+                self.assertAlmostEqual(optics.return_value.observations.call_args.kwargs['tolerance_m'], .003)
+            with np.load(volume) as result:
+                expected = (mask & ~free) | hit
+                np.testing.assert_array_equal(result['occupied'], expected)
+                np.testing.assert_array_equal(result['sdf_cells'] < 0, expected)
+                self.assertAlmostEqual(float(result['sdf_cells'][hit][0]), -.5)
+                self.assertTrue((result['permittivity'][free] == 1).all())
+                np.testing.assert_allclose(result['permittivity'][hit], rows[0]['predictions']['fusion'][0])
             with self.assertRaisesRegex(ValueError, 'separate'):
                 reconstruct(scene, frame, **options)
             with self.assertRaisesRegex(ValueError, 'learned compact single'):

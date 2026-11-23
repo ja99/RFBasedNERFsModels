@@ -80,7 +80,8 @@ def acquisition_protocol(acquisition):
 
 
 def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", weights_dir=None, simulator=None,
-                clearance_cells=None, scene_id=None, depth=None, camera=None, depth_material_model=None, geometry_model=None):
+                clearance_cells=None, scene_id=None, depth=None, camera=None, depth_material_model=None, geometry_model=None,
+                depth_geometry=False, depth_tolerance_mm=0.0):
     """Predict on the protocol’s native grid using its paired receiver recordings."""
     if mode not in ("single", "mixed", "metre") or device not in ("cpu", "cuda"):
         raise ValueError("Choose single, mixed or metre mode and a cpu or cuda device")
@@ -92,6 +93,10 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
     use_depth = any(path is not None for path in sensor_inputs)
     if use_depth and (not all(path is not None for path in sensor_inputs) or mode != "single" or refine):
         raise ValueError("Depth fusion requires --depth, --camera and --depth-material-model in learned compact single mode")
+    if depth_geometry and not use_depth:
+        raise ValueError("--depth-geometry requires the calibrated depth-fusion inputs")
+    if not np.isfinite(depth_tolerance_mm) or depth_tolerance_mm < 0 or (depth_tolerance_mm and not depth_geometry):
+        raise ValueError("Choose a nonnegative finite --depth-tolerance-mm with --depth-geometry")
     if geometry_model is not None and not use_depth:
         raise ValueError("--geometry-model requires the depth-fusion path")
     scene, output = Path(scene).resolve(), Path(output).expanduser()
@@ -141,7 +146,21 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
                 fused = DepthMaterial(depth_material_model)
                 if fused.mode != "fusion" or fused.settings["grid_shape"] != list(sdf.shape):
                     raise ValueError("Expected a registered RF and depth fusion model for this reconstruction grid")
-                estimate = fused.predict_files(scene, depth, camera)
+                frame = np.load(depth, allow_pickle=False)
+                calibration_spec = json.loads(Path(camera).read_text())
+                estimate = fused.predict(wave=calibrated_subset(scene, fused.settings), depth=frame,
+                                         camera=calibration_spec)
+                if depth_geometry:
+                    from DepthGeometry import constrain, registered_camera
+                    from EchoKernel import occupancy_sdf
+
+                    optics = registered_camera(acquisition, sdf.shape, calibration_spec, simulator)
+                    free, surface = optics.observations(frame, tolerance_m=depth_tolerance_mm / 1000.)
+                    sdf = occupancy_sdf(constrain(sdf < 0, free, surface))
+                    sensor_info["geometry_source"] = "rf_and_depth"
+                    sensor_info["depth_tolerance_mm"] = depth_tolerance_mm
+                else:
+                    sensor_info["geometry_source"] = "rf"
                 materials = np.where((sdf < 0)[..., None], estimate, fused.meta["background"]).astype("f4")
                 sensor_info["material_source"] = "rf_and_depth"
                 for name, settings in (("geometry", kernel.settings), ("material", fused.settings)):
@@ -201,11 +220,14 @@ def main():
     parser.add_argument("--clearance-cells", type=int,
                         help=CLEARANCE_HELP + ". Enables gain correction and stores its diagnostics in the output NPZ.")
     parser.add_argument("--depth", type=Path, help="Registered first-return depth frame in metres for learned single mode")
+    parser.add_argument("--depth-geometry", action="store_true", help="Constrain RF geometry by visible depth and free space")
+    parser.add_argument("--depth-tolerance-mm", type=float, default=0.,
+                        help="Depth uncertainty half-width in mm for carving and surface pinning (ideal frames: 0)")
     parser.add_argument("--camera", type=Path, help="Depth camera calibration JSON")
     parser.add_argument("--depth-material-model", type=Path, help="Trained DepthMaterial fusion checkpoint")
     parser.add_argument("--geometry-model", type=Path, help="Depth-fusion geometry checkpoint override, e.g. a broadside-only EchoKernel")
     parser.add_argument("--weights-dir", type=Path, help="Verified weights cache (default ~/.cache/rf-thesis)")
-    parser.add_argument("--simulator", type=Path, help="Simulator checkout for --refine (default sibling checkout)")
+    parser.add_argument("--simulator", type=Path, help="Simulator checkout for --refine or --depth-geometry (default sibling checkout)")
     args = parser.parse_args()
     output = reconstruct(**vars(args))
     print(json.dumps({"output": str(output), "mode": args.mode, "refined": args.refine}))

@@ -232,6 +232,16 @@ def _sdf(mask, support, offset):
         axes = np.indices(mask.shape, dtype='f4').transpose(1, 2, 3, 0)
         return np.stack([np.maximum((plane @ DIRECTIONS.T - support).max(-1) - offset, 1e-5)
                          for plane in axes]).astype('f4')
+    return occupancy_sdf(mask)
+
+
+def occupancy_sdf(mask):
+    """Signed cell-center distances to the boundary of the occupied voxel union."""
+    mask = np.asarray(mask)
+    if mask.ndim != 3 or mask.dtype != bool:
+        raise ValueError("Expected a three-dimensional Boolean mask")
+    if not mask.any():
+        return np.full(mask.shape, np.inf, dtype='f4')
     # A center's closest point on an exposed unit voxel face falls on the
     # half-cell lattice. Dilation identifies that lattice's shared air/solid boundary.
     padded = np.pad(mask, 1)
