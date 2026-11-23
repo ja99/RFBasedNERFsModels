@@ -80,7 +80,7 @@ def acquisition_protocol(acquisition):
 
 
 def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", weights_dir=None, simulator=None,
-                clearance_cells=None, scene_id=None):
+                clearance_cells=None, scene_id=None, depth=None, camera=None, depth_material_model=None, geometry_model=None):
     """Predict on the protocol’s native grid using its paired receiver recordings."""
     if mode not in ("single", "mixed", "metre") or device not in ("cpu", "cuda"):
         raise ValueError("Choose single, mixed or metre mode and a cpu or cuda device")
@@ -88,10 +88,17 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
         raise ValueError("--scene-id selects a recording from the metre archive")
     if refine and mode == "metre":
         raise ValueError("Waveform refinement requires compact single or mixed mode")
+    sensor_inputs = (depth, camera, depth_material_model)
+    use_depth = any(path is not None for path in sensor_inputs)
+    if use_depth and (not all(path is not None for path in sensor_inputs) or mode != "single" or refine):
+        raise ValueError("Depth fusion requires --depth, --camera and --depth-material-model in learned compact single mode")
+    if geometry_model is not None and not use_depth:
+        raise ValueError("--geometry-model requires the depth-fusion path")
     scene, output = Path(scene).resolve(), Path(output).expanduser()
     protected = ("acquisition.json", "sensor_samples.npy", "empty_sensor_samples.npy", "reference_calibration.json",
                  "scene.json", "grid.npy")
-    if output.resolve() in {scene / name for name in protected}:
+    input_paths = {Path(p).expanduser().resolve() for p in (*sensor_inputs, geometry_model) if p is not None}
+    if output.resolve() in input_paths | {scene / name for name in protected}:
         raise ValueError("Choose a separate reconstruction output path")
     manifest = json.loads(MANIFEST.read_text())
     cache = weights_dir if weights_dir is not None else Path.home() / ".cache" / "rf-thesis"
@@ -122,17 +129,37 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
             calibration = calibrate_scene(scene, corrected, clearance_cells)
             scene = corrected
         if mode == "single":
-            kernel = EchoKernel(release_asset(f"{protocol}-kernel.npz", cache, manifest))
-            sdf = kernel.predict_scene(scene)
+            kernel_path = geometry_model or release_asset(f"{protocol}-kernel.npz", cache, manifest)
+            if output.resolve() == Path(kernel_path).resolve():
+                raise ValueError("Choose an output path separate from the geometry checkpoint")
+            kernel = EchoKernel(kernel_path)
+            sensor_info = {}
+            if use_depth:
+                from DepthMaterial import DepthMaterial, calibrated_subset
+
+                sdf = kernel.predict(calibrated_subset(scene, kernel.settings))
+                fused = DepthMaterial(depth_material_model)
+                if fused.mode != "fusion" or fused.settings["grid_shape"] != list(sdf.shape):
+                    raise ValueError("Expected a registered RF and depth fusion model for this reconstruction grid")
+                estimate = fused.predict_files(scene, depth, camera)
+                materials = np.where((sdf < 0)[..., None], estimate, fused.meta["background"]).astype("f4")
+                sensor_info["material_source"] = "rf_and_depth"
+                for name, settings in (("geometry", kernel.settings), ("material", fused.settings)):
+                    acq = settings["acquisition"]
+                    sensor_info[name + "_beam_indices"] = acq.get("acquired_beam_indices", list(range(settings["sensor_shape"][1])))
+                    sensor_info[name + "_receiver_indices"] = acq.get("receive_channel_indices", list(range(settings["sensor_shape"][0])))
+            else:
+                sdf = kernel.predict_scene(scene)
             if refine:
                 initial = Path(scratch) / "initial.npy"
                 np.save(initial, sdf)
             else:
-                model = EchoMaterial(release_asset(f"{protocol}-material.npz", cache, manifest))
-                materials = model.compose(model.predict_scene(scene), sdf)
+                if not use_depth:
+                    model = EchoMaterial(release_asset(f"{protocol}-material.npz", cache, manifest))
+                    materials = model.compose(model.predict_scene(scene), sdf)
                 np.savez_compressed(prediction, sdf_cells=sdf, occupied=sdf < 0, permittivity=materials[..., 0],
                                     conductivity_s_per_m=materials[..., 1], grid_origin_cells=acquisition["grid_origin_cells"],
-                                    grid_spacing_m=acquisition["grid_spacing_m"], scene_id=scene.name)
+                                    grid_spacing_m=acquisition["grid_spacing_m"], scene_id=scene.name, **sensor_info)
         elif refine:
             from EchoSet import SetPredictor
 
@@ -173,6 +200,10 @@ def main():
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu", help="Device for mixed mode or refinement")
     parser.add_argument("--clearance-cells", type=int,
                         help=CLEARANCE_HELP + ". Enables gain correction and stores its diagnostics in the output NPZ.")
+    parser.add_argument("--depth", type=Path, help="Registered first-return depth frame in metres for learned single mode")
+    parser.add_argument("--camera", type=Path, help="Depth camera calibration JSON")
+    parser.add_argument("--depth-material-model", type=Path, help="Trained DepthMaterial fusion checkpoint")
+    parser.add_argument("--geometry-model", type=Path, help="Depth-fusion geometry checkpoint override, e.g. a broadside-only EchoKernel")
     parser.add_argument("--weights-dir", type=Path, help="Verified weights cache (default ~/.cache/rf-thesis)")
     parser.add_argument("--simulator", type=Path, help="Simulator checkout for --refine (default sibling checkout)")
     args = parser.parse_args()

@@ -76,6 +76,24 @@ To fit the compact geometry estimator using coherent I/Q, run `python EchoKernel
 - Training scenes set the per-channel grid scales and maximum absolute echo. Held-out values may exceed the training range. The archive and checkpoint retain the transform and split so evaluation uses the same physical SDF zero and input calibration. Evaluation reports per-scene and pooled occupancy intersection-over-union (IoU), occupied voxel counts, and mean absolute SDF error in grid cells.
 - To evaluate a newly acquired folder of scenes, use the same sensor and grid configuration, distinct scene IDs and fresh geometry. Run `python SaveAsHDF5.py NEW_SCENES --normalization-from "$RF_RUN/scenes/dataset.hdf5"`, then run `evaluate --data NEW_SCENES` with the trained checkpoint. All scenes in that new archive enter its test split.
 
+## Registered depth camera and single-shot RF
+
+A compact single-object reconstruction can estimate the object's relative permittivity and conductivity from calibrated RF and a co-registered optical-axis depth frame in metres (zero for a missed ray). The simulator's `DepthCamera.py` renders one first-surface frame per scene into a separate cache. Fitting uses the existing normalized RF archive and the matching camera frames. The three learned models estimate a single homogeneous material from RF only, visible depth only, or both. All use training-fitted feature projections and scalar ridge regressors selected on a separate validation split. Shuffled controls exchange one sensor while keeping the other paired with its scene.
+
+```bash
+# VIEW contains train/ and test/ broadside-only RF archives built by the receiver ablation.
+# FRAMES contains camera.json and scene_ID/depth.npy for both splits.
+OPENBLAS_NUM_THREADS=1 python DepthMaterial.py study --train "$VIEW/train" --test "$VIEW/test" \
+    --frames "$FRAMES" --output "$WEIGHTS"
+python DepthMaterial.py infer --model "$WEIGHTS/fusion.npz" --rf-scene "$RAW/scene_010000" \
+    --depth "$FRAMES/scene_010000/depth.npy" --camera "$FRAMES/camera.json"
+python Reconstruct.py "$RAW/scene_010000" reconstruction.npz \
+    --geometry-model "$VIEW/model.npz" --depth-material-model "$WEIGHTS/fusion.npz" \
+    --depth "$FRAMES/scene_010000/depth.npy" --camera "$FRAMES/camera.json"
+```
+
+With the broadside geometry checkpoint in this example both branches use one transmitted pulse and 16 simultaneous receivers. Omitting `--geometry-model` selects the released five-shot RF geometry estimator. The material branch still uses the shot subset stored in its checkpoint. The output records the receiver and shot indices used by each branch. Depth fusion is available in learned compact single-object mode. Each raw recording can contain additional shots as long as the acquisition matches the fitted protocol. Inference reads the RF recording pair, RF acquisition metadata, depth frame and camera calibration. Labels are used only to fit and score the models.
+
 ## Historical data
 
 An old `dataset.hdf5` can still be read in place. Its original preprocessing and physical SDF zero were never stored. Legacy rendering uses matched normalized SDF slices and reports normalized error. A deterministic fallback split is available, but the original training membership cannot be recovered from that archive.

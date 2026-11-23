@@ -15,6 +15,7 @@ from EchoKernel import (
 
 
 PARAMETERS = ('relative_permittivity', 'conductivity_s_per_m')
+RF_MIXES = ((.35, .15, .30, .20), (.10, .10, .30, .50), (.15, .05, .10, .70))
 
 
 def _homogeneous(values, name):
@@ -90,23 +91,9 @@ def _physical(values):
     return np.maximum(values, [1e-6, 0.])
 
 
-def fit(data, output):
+def _fit_regressor(train_features, validation_features, y, truth, standardize, mixes):
     rng = np.random.default_rng(127)
-    with _archive(data) as f:
-        settings = _settings(f)
-        training = np.asarray(f['splits/train'], dtype=int)
-        valid = np.asarray(f['splits/validation'], dtype=int)
-        if not len(training) or not len(valid) or np.intersect1d(training, valid).size:
-            raise ValueError('Separate nonempty training and validation splits are required')
-        train_features, y, bg = _rows(f, training, settings)
-        validation_features, truth, val_background = _rows(f, valid, settings)
-        names = f['scene_ids'].asstr()
-        training_ids = [names[i] for i in training]
-        validation_ids = [names[i] for i in valid]
-    background = _homogeneous(bg, 'Training background')
-    if not np.allclose(val_background, background, rtol=2e-6, atol=[2e-5, 1e-7]):
-        raise ValueError('Training and validation background materials disagree')
-    transforms = [_fit_projection(group, i != 1, rng) for i, group in enumerate(train_features)]
+    transforms = [_fit_projection(group, standardize[i], rng) for i, group in enumerate(train_features)]
     xf = _project(train_features, transforms)
     qf = _project(validation_features, transforms)
     mean = y.mean(0)
@@ -119,7 +106,7 @@ def fit(data, output):
 
     # For scalar material parameters, a location-invariant spectral summary is
     # useful alongside antenna-resolved signed amplitudes and echo timing.
-    for mix in ((.35, .15, .30, .20), (.10, .10, .30, .50), (.15, .05, .10, .70)):
+    for mix in mixes:
         x, query = _blend(xf, mix), _blend(qf, mix)
         indices = np.random.default_rng(37).choice(len(x), min(160, len(x)), replace=False)
         anchors = x[indices]
@@ -148,20 +135,56 @@ def fit(data, output):
                             learned[j] = dict(design_mean=design_mean, coef=coef[:, j])
                             if width:
                                 learned[j]['anchors'] = anchors
-    details = dict(model_type='echo_material', format_version=1, settings=settings, choices=choices,
-                   training_ids=training_ids, validation_ids=validation_ids, train_mean=mean.tolist(),
-                   train_spread=spread.tolist(), target_scale=scale.tolist(), background=background.tolist(),
-                   validation_normalized_mae=best.tolist())
     arrays = {}
     for i, (m, s, b) in enumerate(transforms):
         arrays.update({f'mean_{i}': m, f'scale_{i}': s, f'basis_{i}': b})
     for j, group in enumerate(learned):
         arrays.update({f'{key}_p{j}': value for key, value in group.items()})
+    details = dict(choices=choices, train_mean=mean.tolist(), train_spread=spread.tolist(),
+                   target_scale=scale.tolist(), validation_normalized_mae=best.tolist())
+    return details, arrays
+
+
+def fit(data, output):
+    with _archive(data) as f:
+        settings = _settings(f)
+        training = np.asarray(f['splits/train'], dtype=int)
+        valid = np.asarray(f['splits/validation'], dtype=int)
+        if not len(training) or not len(valid) or np.intersect1d(training, valid).size:
+            raise ValueError('Separate nonempty training and validation splits are required')
+        train_features, y, bg = _rows(f, training, settings)
+        validation_features, truth, val_background = _rows(f, valid, settings)
+        names = f['scene_ids'].asstr()
+        training_ids = [names[i] for i in training]
+        validation_ids = [names[i] for i in valid]
+    background = _homogeneous(bg, 'Training background')
+    if not np.allclose(val_background, background, rtol=2e-6, atol=[2e-5, 1e-7]):
+        raise ValueError('Training and validation background materials disagree')
+    details, arrays = _fit_regressor(train_features, validation_features, y, truth, (True, False, True, True), RF_MIXES)
+    details.update(model_type='echo_material', format_version=1, settings=settings, training_ids=training_ids,
+                   validation_ids=validation_ids, background=background.tolist())
+    best = np.array(details['validation_normalized_mae'])
+    choices = details['choices']
     _save_model(output, details, arrays)
     return dict(training_scenes=len(training), validation_scenes=len(valid),
                 validation_normalized_mae=dict(zip(PARAMETERS, best.tolist())),
                 validation_mean_normalized_mae=float(best.mean()), choices=dict(zip(PARAMETERS, choices)),
                 model_bytes=Path(output).stat().st_size)
+
+
+def _predict_features(groups, transforms, meta, arrays):
+    codes = _project([g[None] for g in groups], transforms)
+    mean = np.asarray(meta['train_mean'])
+    result = mean.copy()
+    for j, choice in enumerate(meta['choices']):
+        if choice['method'] != 'train_mean':
+            x = _blend(codes, choice['mix'])
+            if choice['width']:
+                x = _design(x, arrays[f'anchors_p{j}'], choice['width'])
+            value = float(((x - arrays[f'design_mean_p{j}']) @ arrays[f'coef_p{j}']).item())
+            absolute = max(1e-6 if j == 0 else 0., mean[j] + value * meta['target_scale'][j])
+            result[j] += choice['shrink'] * (absolute - mean[j])
+    return result
 
 
 class EchoMaterial:
@@ -184,18 +207,7 @@ class EchoMaterial:
         if tuple(wave.shape) != tuple(self.settings['sensor_shape']):
             raise ValueError('RF input axes differ from those used in training')
         groups = _features(wave, self.settings['acquisition'])
-        codes = _project([g[None] for g in groups], self.transforms)
-        mean = np.asarray(self.meta['train_mean'])
-        result = mean.copy()
-        for j, choice in enumerate(self.meta['choices']):
-            if choice['method'] != 'train_mean':
-                x = _blend(codes, choice['mix'])
-                if choice['width']:
-                    x = _design(x, self.arrays[f'anchors_p{j}'], choice['width'])
-                value = float(((x - self.arrays[f'design_mean_p{j}']) @ self.arrays[f'coef_p{j}']).item())
-                absolute = max(1e-6 if j == 0 else 0., mean[j] + value * self.meta['target_scale'][j])
-                result[j] += choice['shrink'] * (absolute - mean[j])
-        return result
+        return _predict_features(groups, self.transforms, self.meta, self.arrays)
 
     def predict_scene(self, directory):
         return self.predict(_calibrated_pair(directory, self.settings))
