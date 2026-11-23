@@ -81,7 +81,7 @@ def acquisition_protocol(acquisition):
 
 def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", weights_dir=None, simulator=None,
                 clearance_cells=None, scene_id=None, depth=None, camera=None, depth_material_model=None, geometry_model=None,
-                depth_geometry=False, depth_tolerance_mm=0.0):
+                depth_geometry=False, depth_tolerance_mm=0.0, material_blend_baseline=None):
     """Predict on the protocol’s native grid using its paired receiver recordings."""
     if mode not in ("single", "mixed", "metre") or device not in ("cpu", "cuda"):
         raise ValueError("Choose single, mixed or metre mode and a cpu or cuda device")
@@ -93,6 +93,8 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
     use_depth = any(path is not None for path in sensor_inputs)
     if use_depth and (not all(path is not None for path in sensor_inputs) or mode != "single" or refine):
         raise ValueError("Depth fusion requires --depth, --camera and --depth-material-model in learned compact single mode")
+    if material_blend_baseline is not None and (not use_depth or Path(depth_material_model).suffix != ".pt"):
+        raise ValueError("--material-blend-baseline requires a neural .pt depth material model")
     if depth_geometry and not use_depth:
         raise ValueError("--depth-geometry requires the calibrated depth-fusion inputs")
     if not np.isfinite(depth_tolerance_mm) or depth_tolerance_mm < 0 or (depth_tolerance_mm and not depth_geometry):
@@ -102,7 +104,7 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
     scene, output = Path(scene).resolve(), Path(output).expanduser()
     protected = ("acquisition.json", "sensor_samples.npy", "empty_sensor_samples.npy", "reference_calibration.json",
                  "scene.json", "grid.npy")
-    input_paths = {Path(p).expanduser().resolve() for p in (*sensor_inputs, geometry_model) if p is not None}
+    input_paths = {Path(p).expanduser().resolve() for p in (*sensor_inputs, geometry_model, material_blend_baseline) if p is not None}
     if output.resolve() in input_paths | {scene / name for name in protected}:
         raise ValueError("Choose a separate reconstruction output path")
     manifest = json.loads(MANIFEST.read_text())
@@ -143,7 +145,13 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
                 from DepthMaterial import DepthMaterial, calibrated_subset
 
                 sdf = kernel.predict(calibrated_subset(scene, kernel.settings))
-                fused = DepthMaterial(depth_material_model)
+                if Path(depth_material_model).suffix == ".pt":
+                    from NeuralDepthMaterial import NeuralDepthMaterial
+
+                    fused = NeuralDepthMaterial(depth_material_model, material_blend_baseline)
+                    sensor_info["material_estimator"] = "neural_kernel_blend" if material_blend_baseline else "neural"
+                else:
+                    fused = DepthMaterial(depth_material_model)
                 if fused.mode != "fusion" or fused.settings["grid_shape"] != list(sdf.shape):
                     raise ValueError("Expected a registered RF and depth fusion model for this reconstruction grid")
                 frame = np.load(depth, allow_pickle=False)
@@ -224,7 +232,8 @@ def main():
     parser.add_argument("--depth-tolerance-mm", type=float, default=0.,
                         help="Depth uncertainty half-width in mm for carving and surface pinning (ideal frames: 0)")
     parser.add_argument("--camera", type=Path, help="Depth camera calibration JSON")
-    parser.add_argument("--depth-material-model", type=Path, help="Trained DepthMaterial fusion checkpoint")
+    parser.add_argument("--depth-material-model", type=Path, help="Trained kernel (.npz) or neural (.pt) depth material model")
+    parser.add_argument("--material-blend-baseline", type=Path, help="Kernel checkpoint for the validation-selected neural blend")
     parser.add_argument("--geometry-model", type=Path, help="Depth-fusion geometry checkpoint override, e.g. a broadside-only EchoKernel")
     parser.add_argument("--weights-dir", type=Path, help="Verified weights cache (default ~/.cache/rf-thesis)")
     parser.add_argument("--simulator", type=Path, help="Simulator checkout for --refine or --depth-geometry (default sibling checkout)")

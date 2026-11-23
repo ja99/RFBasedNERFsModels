@@ -107,3 +107,21 @@ The field solver, waveform steering and voxel-boundary fixes take effect during 
 For historical raw scene folders, select `--raw` explicitly or supply an empty recording acquired with the same settings via `--empty-reference`. A shared reference for a scene with recorded metadata needs matching `acquisition.json` alongside the reference. Declare single-shot arrays with `--single-shot`, and verified antenna-major five-shot packed arrays with `--sensor-layout packed-antenna-direction`. A direction-first 3-D array uses `--sensor-layout direction,antenna,timestep`. Use `--crop-x-end 15` only to reproduce the additional old x crop. Converting writes a new `dataset.hdf5` in that directory, so keep the historical archive separately if it is needed for an old checkpoint.
 
 Historical checkpoints need their original raw archive. For a FullyINR checkpoint missing its architecture metadata, loading recovers layer widths from the weights and assumes the thesis training script's GELU activation. Supply `--activation Tanh` at evaluation or rendering if that run used Tanh. New checkpoints trained on empty-subtracted signals require compatible calibrated data. The historical voxel-sampling and RF probes remain reproducible against the archived Git revisions in the [audit notebook in the private thesis repository](https://github.com/ja99/MasterThesisLatex/blob/main/diagnostics/rf_reconstruction_audit.ipynb).
+
+### Geometry-conditioned neural material estimation
+
+`NeuralDepthMaterial.py` fits a CPU model to one calibrated broadside shot from a 4 × 4 array and a registered depth frame. A shared bank of learned full-window temporal filters encodes each receiver's signed trace and log spectrum. Two spatial convolutions across the aperture combine the receiver encodings. A separate convolutional encoder processes the depth image and validity mask, pooled to 8 × 8 patches. Camera geometry features modulate the RF encoding by channel-wise gain and bias. A spectral-summary branch preserves RF amplitudes that per-trace normalization removes. The joint head estimates relative permittivity and conductivity for one homogeneous inclusion.
+
+The study fits three fixed seeds with training-only standardization and selects each member's checkpoint by mean validation error normalized by the two training target spreads. `ensemble.pt` averages the three retained networks. An optional per-property blend with the prior kernel fusion estimator selects neural weights from 0, 0.25, 0.5, 0.75 and 1 using validation error. The neural checkpoint records the baseline file hash, both calibration specifications, split IDs and the selected weights.
+
+```bash
+python NeuralDepthMaterial.py --threads 2 study --train "$RF_VIEW/train" --test "$RF_VIEW/test" \
+  --frames "$DEPTH/frames" --baseline "$DEPTH/material/fusion.npz" --output "$OUT"
+
+python Reconstruct.py "$SCENE" "$OUT/example.npz" \
+  --geometry-model "$RF_VIEW/model.npz" --depth-geometry \
+  --depth "$FRAME" --camera "$DEPTH/frames/camera.json" \
+  --depth-material-model "$OUT/ensemble.pt" --material-blend-baseline "$DEPTH/material/fusion.npz"
+```
+
+Set `RF_VIEW` to the previous broadside archive directory, `DEPTH` to the depth-camera study directory, `SCENE` to a raw RF scene, `FRAME` to its metric depth image, and `OUT` to a separate model output directory. Omitting `--material-blend-baseline` uses the neural ensemble alone. Existing kernel checkpoints continue to use the original prediction path.
