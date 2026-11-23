@@ -81,7 +81,7 @@ def acquisition_protocol(acquisition):
 
 def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", weights_dir=None, simulator=None,
                 clearance_cells=None, scene_id=None, depth=None, camera=None, depth_material_model=None, geometry_model=None,
-                depth_geometry=False, depth_tolerance_mm=0.0, material_blend_baseline=None):
+                depth_geometry=False, depth_tolerance_mm=0.0, material_blend_baseline=None, geometry_completion_model=None):
     """Predict on the protocol’s native grid using its paired receiver recordings."""
     if mode not in ("single", "mixed", "metre") or device not in ("cpu", "cuda"):
         raise ValueError("Choose single, mixed or metre mode and a cpu or cuda device")
@@ -95,6 +95,10 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
         raise ValueError("Depth fusion requires --depth, --camera and --depth-material-model in learned compact single mode")
     if material_blend_baseline is not None and (not use_depth or Path(depth_material_model).suffix != ".pt"):
         raise ValueError("--material-blend-baseline requires a neural .pt depth material model")
+    if geometry_completion_model is not None:
+        if geometry_model is not None:
+            raise ValueError("Choose either --geometry-completion-model or --geometry-model")
+        depth_geometry = True
     if depth_geometry and not use_depth:
         raise ValueError("--depth-geometry requires the calibrated depth-fusion inputs")
     if not np.isfinite(depth_tolerance_mm) or depth_tolerance_mm < 0 or (depth_tolerance_mm and not depth_geometry):
@@ -104,7 +108,7 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
     scene, output = Path(scene).resolve(), Path(output).expanduser()
     protected = ("acquisition.json", "sensor_samples.npy", "empty_sensor_samples.npy", "reference_calibration.json",
                  "scene.json", "grid.npy")
-    input_paths = {Path(p).expanduser().resolve() for p in (*sensor_inputs, geometry_model, material_blend_baseline) if p is not None}
+    input_paths = {Path(p).expanduser().resolve() for p in (*sensor_inputs, geometry_model, material_blend_baseline, geometry_completion_model) if p is not None}
     if output.resolve() in input_paths | {scene / name for name in protected}:
         raise ValueError("Choose a separate reconstruction output path")
     manifest = json.loads(MANIFEST.read_text())
@@ -136,15 +140,33 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
             calibration = calibrate_scene(scene, corrected, clearance_cells)
             scene = corrected
         if mode == "single":
-            kernel_path = geometry_model or release_asset(f"{protocol}-kernel.npz", cache, manifest)
-            if output.resolve() == Path(kernel_path).resolve():
-                raise ValueError("Choose an output path separate from the geometry checkpoint")
-            kernel = EchoKernel(kernel_path)
             sensor_info = {}
+            if geometry_completion_model is None:
+                kernel_path = geometry_model or release_asset(f"{protocol}-kernel.npz", cache, manifest)
+                if output.resolve() == Path(kernel_path).resolve():
+                    raise ValueError("Choose an output path separate from the geometry checkpoint")
+                kernel = EchoKernel(kernel_path)
             if use_depth:
                 from DepthMaterial import DepthMaterial, calibrated_subset
 
-                sdf = kernel.predict(calibrated_subset(scene, kernel.settings))
+                frame = np.load(depth, allow_pickle=False)
+                calibration_spec = json.loads(Path(camera).read_text())
+                if geometry_completion_model is not None:
+                    from DepthCompletion import Completion
+                    from EchoKernel import occupancy_sdf
+
+                    completion = Completion(geometry_completion_model, simulator=simulator)
+                    uses_rf = completion.meta["mode"] == "fusion"
+                    wave = calibrated_subset(scene, completion.settings) if uses_rf else None
+                    mask = completion.predict(frame, calibration_spec, wave, depth_tolerance_mm / 1000.)
+                    sdf = occupancy_sdf(mask)
+                    geometry_settings = completion.settings if uses_rf else None
+                    sensor_info["geometry_source"] = "rf_depth_completion" if uses_rf else "depth_completion"
+                    sensor_info["depth_tolerance_mm"] = depth_tolerance_mm
+                else:
+                    geometry_settings = kernel.settings
+                    sdf = kernel.predict(calibrated_subset(scene, kernel.settings))
+                    sensor_info["geometry_source"] = "rf"
                 if Path(depth_material_model).suffix == ".pt":
                     from NeuralDepthMaterial import NeuralDepthMaterial
 
@@ -154,11 +176,9 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
                     fused = DepthMaterial(depth_material_model)
                 if fused.mode != "fusion" or fused.settings["grid_shape"] != list(sdf.shape):
                     raise ValueError("Expected a registered RF and depth fusion model for this reconstruction grid")
-                frame = np.load(depth, allow_pickle=False)
-                calibration_spec = json.loads(Path(camera).read_text())
                 estimate = fused.predict(wave=calibrated_subset(scene, fused.settings), depth=frame,
                                          camera=calibration_spec)
-                if depth_geometry:
+                if depth_geometry and geometry_completion_model is None:
                     from DepthGeometry import constrain, registered_camera
                     from EchoKernel import occupancy_sdf
 
@@ -167,11 +187,13 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
                     sdf = occupancy_sdf(constrain(sdf < 0, free, surface))
                     sensor_info["geometry_source"] = "rf_and_depth"
                     sensor_info["depth_tolerance_mm"] = depth_tolerance_mm
-                else:
-                    sensor_info["geometry_source"] = "rf"
                 materials = np.where((sdf < 0)[..., None], estimate, fused.meta["background"]).astype("f4")
                 sensor_info["material_source"] = "rf_and_depth"
-                for name, settings in (("geometry", kernel.settings), ("material", fused.settings)):
+                for name, settings in (("geometry", geometry_settings), ("material", fused.settings)):
+                    if settings is None:
+                        sensor_info[name + "_beam_indices"] = np.array([], dtype=int)
+                        sensor_info[name + "_receiver_indices"] = np.array([], dtype=int)
+                        continue
                     acq = settings["acquisition"]
                     sensor_info[name + "_beam_indices"] = acq.get("acquired_beam_indices", list(range(settings["sensor_shape"][1])))
                     sensor_info[name + "_receiver_indices"] = acq.get("receive_channel_indices", list(range(settings["sensor_shape"][0])))
@@ -234,6 +256,8 @@ def main():
     parser.add_argument("--camera", type=Path, help="Depth camera calibration JSON")
     parser.add_argument("--depth-material-model", type=Path, help="Trained kernel (.npz) or neural (.pt) depth material model")
     parser.add_argument("--material-blend-baseline", type=Path, help="Kernel checkpoint for the validation-selected neural blend")
+    parser.add_argument("--geometry-completion-model", type=Path,
+                        help="Predict convex support behind observed depth surfaces using a DepthCompletion checkpoint")
     parser.add_argument("--geometry-model", type=Path, help="Depth-fusion geometry checkpoint override, e.g. a broadside-only EchoKernel")
     parser.add_argument("--weights-dir", type=Path, help="Verified weights cache (default ~/.cache/rf-thesis)")
     parser.add_argument("--simulator", type=Path, help="Simulator checkout for --refine or --depth-geometry (default sibling checkout)")

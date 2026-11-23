@@ -125,3 +125,15 @@ python Reconstruct.py "$SCENE" "$OUT/example.npz" \
 ```
 
 Set `RF_VIEW` to the previous broadside archive directory, `DEPTH` to the depth-camera study directory, `SCENE` to a raw RF scene, `FRAME` to its metric depth image, and `OUT` to a separate model output directory. Omitting `--material-blend-baseline` uses the neural ensemble alone. Existing kernel checkpoints continue to use the original prediction path.
+
+### Learned completion of visible geometry
+
+`DepthCompletion.py` learns how far a single visible convex object extends past its first-return surface, using a depth-only or RF-and-depth network. It fits the train and validation splits of the existing calibrated archive. The camera calibration and input RF protocol are saved in each checkpoint. This model expects a positive camera return and was evaluated on simulated individual spheres and boxes.
+
+```bash
+python DepthCompletion.py fit "$RF_VIEW/train" "$FRAMES" "$GEOMETRY"
+python Reconstruct.py "$SCENE" prediction.npz --geometry-completion-model "$GEOMETRY/fusion.pt" \
+  --depth-material-model "$MATERIAL/fusion.npz" --depth "$FRAMES/$ID/depth.npy" --camera "$FRAMES/camera.json"
+```
+
+The geometry checkpoint replaces the kernel geometry estimate in learned compact single-object mode. `depth.pt` uses only the camera for geometry. The material branch still receives RF and depth. With uncertain depth, `--depth-tolerance-mm 3` preserves the learned completion in the uncertain ±3 mm surface band when applying the final camera constraints. The learned features themselves still derive from the measured surface.
