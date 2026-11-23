@@ -10,6 +10,7 @@ import h5py
 import numpy as np
 from scipy.linalg import cho_factor, cho_solve
 from scipy.ndimage import binary_dilation, binary_erosion, distance_transform_edt
+from scipy.signal import hilbert
 
 
 def _directions():
@@ -22,6 +23,7 @@ def _directions():
 
 
 DIRECTIONS = _directions()
+REPRESENTATIONS = ('voltage', 'iq', 'magnitude', 'voltage-envelope-stats')
 
 
 def _archive(path):
@@ -50,19 +52,54 @@ def _target(f, index):
     return f['grids'][index, ..., 2] * f.attrs['grid_scale'][2] + f.attrs['grid_min'][2]
 
 
-def _echo_features(wave):
+def _baseband(wave, acquisition):
+    """Full-band analytic envelope with one common phase origin for every receiver and shot."""
+    try:
+        carrier = float(acquisition['frequency_hz'])
+        step = float(acquisition['time_step_s'])
+        stride = acquisition['sample_stride']
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError('I/Q requires acquisition frequency_hz, time_step_s and sample_stride') from error
+    if (not isinstance(stride, (int, np.integer)) or isinstance(stride, bool) or stride < 1 or
+            not np.isfinite([carrier, step]).all() or min(carrier, step) <= 0 or carrier * step * stride >= .5):
+        raise ValueError('I/Q requires a positive carrier below the sampled Nyquist frequency')
+    steps = wave.shape[-1]
+    # Append two windows of zeros before the periodic FFT Hilbert transform.
+    # This is shift-equivalent to padding one window on either side.
+    analytic = hilbert(wave.astype('f8'), N=3*steps, axis=-1)[..., :steps]
+    oscillator = np.exp(-2j * np.pi * carrier * step * stride * np.arange(steps))
+    return analytic * oscillator
+
+
+def _echo_features(wave, representation='voltage', acquisition=None):
     wave = np.asarray(wave, dtype='f4')
     if wave.ndim != 3 or not np.isfinite(wave).all():
         raise ValueError('Expected a finite antenna-by-beam-by-time waveform')
     steps = wave.shape[-1]
     edges = np.linspace(0, steps, min(48, steps) + 1, dtype=int)
-    pooled = np.add.reduceat(wave, edges[:-1], axis=-1) / np.diff(edges)
-    power = wave.astype('f8') ** 2
+    if representation == 'voltage':
+        signal = wave
+        power = wave.astype('f8') ** 2
+    elif representation in REPRESENTATIONS:
+        baseband = _baseband(wave, acquisition)
+        envelope = np.abs(baseband)
+        power = envelope ** 2
+        signal = {'iq': baseband, 'magnitude': envelope, 'voltage-envelope-stats': wave}[representation]
+    else:
+        raise ValueError(f'Unknown echo representation {representation!r}')
+    pooled = np.add.reduceat(signal, edges[:-1], axis=-1) / np.diff(edges)
+    if representation == 'iq':
+        pooled = np.concatenate((pooled.real, pooled.imag), axis=-1)
     total = power.sum(axis=-1)
     rms = np.sqrt(total / steps)
     floor = max(rms.max() * 1e-6, 1e-12)
     signed = pooled / max(np.linalg.norm(pooled), 1e-12)
-    unit = pooled / np.maximum(rms, floor)[..., None]
+    waveform_rms, waveform_floor = rms, floor
+    if representation == 'voltage-envelope-stats':
+        # Keep both pooled-voltage groups byte-identical to the historical representation.
+        waveform_rms = np.sqrt(np.sum(wave.astype('f8') ** 2, axis=-1) / steps)
+        waveform_floor = max(waveform_rms.max() * 1e-6, 1e-12)
+    unit = pooled / np.maximum(waveform_rms, waveform_floor)[..., None]
     cumulative = np.cumsum(power, axis=-1)
     fractions = [np.argmax(cumulative >= p * total[..., None], axis=-1) / max(steps - 1, 1)
                  for p in (0.01, 0.05, 0.15, 0.35, 0.5, 0.75, 0.95)]
@@ -223,7 +260,7 @@ def _validation_iou(predicted, masks, offsets):
     return scores / len(masks)
 
 
-def fit(data, output, *, reflections=True):
+def fit(data, output, *, reflections=True, representation='voltage'):
     rng = np.random.default_rng(734)
     with _archive(data) as f:
         settings = _settings(f)
@@ -240,14 +277,14 @@ def fit(data, output, *, reflections=True):
             templates.append(wave.ravel() / max(np.linalg.norm(wave), 1e-12))
             support = _support(_target(f, i) < 0)
             for antennas, beams, normals, translation in variants:
-                feature_rows.append(_echo_features(wave[antennas][:, beams]))
+                feature_rows.append(_echo_features(wave[antennas][:, beams], representation, settings['acquisition']))
                 targets.append(support[normals] + translation)
         masks = [_target(f, i) < 0 for i in validation]
         query_features, template_ious = [], []
         templates = np.stack(templates)
         for i, truth in zip(validation, masks):
             wave = _signal(f, i, settings)
-            query_features.append(_echo_features(wave))
+            query_features.append(_echo_features(wave, representation, settings['acquisition']))
             neighbor = train[np.argmax(templates @ wave.ravel())]
             proposal = _target(f, neighbor) < 0
             template_ious.append(np.count_nonzero(proposal & truth) / max(1, np.count_nonzero(proposal | truth)))
@@ -310,7 +347,8 @@ def fit(data, output, *, reflections=True):
                     predictions = (evaluate - mean) @ coef + target_mean
                     score(predictions, dict(config, method='ridge', width=width, ridge=ridge),
                           dict(anchors=anchors, design_mean=mean, coef=coef, target_mean=target_mean))
-    meta = dict(format_version=1, settings=settings, choice=winner, training_ids=training_ids,
+    meta = dict(format_version=1 if representation == 'voltage' else 2, representation=representation,
+                settings=settings, choice=winner, training_ids=training_ids,
                 validation_ids=validation_ids, validation_mean_scene_iou=best,
                 validation_template_mean_scene_iou=float(np.mean(template_ious)))
     payload = dict(parameters)
@@ -318,7 +356,7 @@ def fit(data, output, *, reflections=True):
         payload.update({f'mean_{i}': mean, f'scale_{i}': scale, f'basis_{i}': basis})
     output = Path(output)
     _save_model(output, meta, payload)
-    return dict(training_scenes=len(train), validation_scenes=len(validation), choice=winner,
+    return dict(representation=representation, training_scenes=len(train), validation_scenes=len(validation), choice=winner,
                 validation_mean_scene_iou=best, validation_template_mean_scene_iou=float(np.mean(template_ious)),
                 model_bytes=output.stat().st_size)
 
@@ -341,7 +379,10 @@ class EchoKernel:
         with np.load(path, allow_pickle=False) as store:
             self.meta = json.loads(store['meta'].item())
             self.arrays = {k: store[k] for k in store.files if k != 'meta'}
-        if self.meta.get('format_version') != 1:
+        version = self.meta.get('format_version')
+        self.representation = self.meta.get('representation', 'voltage' if version == 1 else None)
+        if (version not in (1, 2) or self.representation not in REPRESENTATIONS or
+                (version == 1 and self.representation != 'voltage')):
             raise ValueError('Unknown EchoKernel model format')
         self.settings = self.meta['settings']
         self.transforms = [tuple(self.arrays[f'{key}_{i}'] for key in ('mean', 'scale', 'basis'))
@@ -351,7 +392,7 @@ class EchoKernel:
         """Return a full-resolution signed distance field in cells from a calibrated archive waveform."""
         if tuple(wave.shape) != tuple(self.settings['sensor_shape']):
             raise ValueError('RF input axes differ from those used in training')
-        groups = [g[None] for g in _echo_features(wave)]
+        groups = [g[None] for g in _echo_features(wave, self.representation, self.settings['acquisition'])]
         choice = self.meta['choice']
         q = _blend(_project(groups, self.transforms), choice['mix'])
         p = self.arrays
@@ -420,6 +461,8 @@ def main():
     fit_args.add_argument('--data', type=Path, required=True)
     fit_args.add_argument('--output', type=Path, required=True)
     fit_args.add_argument('--no-reflections', action='store_true', help='Fit using only measured training views')
+    fit_args.add_argument('--representation', choices=REPRESENTATIONS, default='voltage',
+                          help='Use signed voltage, coherent baseband I/Q, or baseband envelope magnitude')
     eval_args = commands.add_parser('evaluate')
     eval_args.add_argument('--data', type=Path, required=True)
     eval_args.add_argument('--model', type=Path, required=True)
@@ -434,7 +477,7 @@ def main():
     infer.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     if args.action == 'fit':
-        report = fit(args.data, args.output, reflections=not args.no_reflections)
+        report = fit(args.data, args.output, reflections=not args.no_reflections, representation=args.representation)
     elif args.action == 'evaluate':
         report = evaluate(EchoKernel(args.model), args.data, args.split)
         if args.output:

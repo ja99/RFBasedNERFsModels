@@ -6,10 +6,40 @@ import unittest
 import h5py
 import numpy as np
 
-from EchoKernel import DIRECTIONS, EchoKernel, _mask, _reflections, _sdf, _support, evaluate, fit
+from EchoKernel import DIRECTIONS, REPRESENTATIONS, EchoKernel, _baseband, _echo_features, _mask
+from EchoKernel import _reflections, _sdf, _support, evaluate, fit
 
 
 class EchoKernelTests(unittest.TestCase):
+    def test_full_band_iq_remodulates_and_preserves_receiver_phase(self):
+        metadata = dict(frequency_hz=2e9, time_step_s=1e-11, sample_stride=4)
+        t = np.arange(256)
+        phase = 2 * np.pi * .08 * t
+        envelope = np.exp(-((t - 128) / 26.) ** 2)
+        phases = np.array([0., .7])[:, None, None]
+        pulse = envelope * np.cos(phase + phases)
+        np.testing.assert_allclose(_baseband(pulse, metadata), envelope * np.exp(1j * phases), atol=1e-9)
+        # Include DC, Nyquist and energy at the window edges.
+        wave = np.random.default_rng(76).normal(size=(3, 2, 256))
+        restored = (_baseband(wave, metadata) * np.exp(1j * phase)).real
+        np.testing.assert_allclose(restored, wave, atol=1e-12)
+        with self.assertRaisesRegex(ValueError, 'I/Q requires'):
+            _baseband(wave, {})
+
+    def test_voltage_and_envelope_controls_share_the_intended_groups(self):
+        wave = np.random.default_rng(5).normal(size=(4, 1, 128))
+        metadata = dict(frequency_hz=2.4e9, time_step_s=1e-11, sample_stride=2)
+        voltage, iq, magnitude, control = [_echo_features(wave, r, metadata) for r in REPRESENTATIONS]
+        for x, y in zip(voltage[:2], control[:2]):
+            np.testing.assert_array_equal(x, y)
+        for group in (magnitude, control):
+            np.testing.assert_array_equal(iq[2], group[2])
+        self.assertEqual(iq[0].size, 2 * magnitude[0].size)
+        # Sign is an absolute phase rotation; the magnitude branch should lose it.
+        for positive, negative in zip(magnitude, _echo_features(-wave, 'magnitude', metadata)):
+            np.testing.assert_array_equal(positive, negative)
+        np.testing.assert_array_equal(iq[0], -_echo_features(-wave, 'iq', metadata)[0])
+
     def test_exact_cuboid_support_and_signed_voxel_distances(self):
         target = np.zeros((9, 11, 12), dtype=bool)
         target[2:7, 3:8, 1:7] = True
@@ -38,7 +68,8 @@ class EchoKernelTests(unittest.TestCase):
             root = Path(tmp)
             archive = root / 'dataset.hdf5'
             ids = [f'scene_{i}' for i in range(10)]
-            meta = dict(sensor_layout='antenna,direction,timestep')
+            meta = dict(sensor_layout='antenna,direction,timestep', frequency_hz=2.4e9,
+                        time_step_s=1e-11, sample_stride=2)
             t = np.arange(32)
             signals, grids = [], []
             for i in range(10):
@@ -61,21 +92,24 @@ class EchoKernelTests(unittest.TestCase):
                 # Training and validation must work without even finite values on the sealed split.
                 f['sensor_samples'][9] = np.nan
                 f['grids'][9] = np.nan
-            checkpoint = root / 'model.npz'
-            summary = fit(root, checkpoint)
-            model = EchoKernel(checkpoint)
-            self.assertEqual(summary['training_scenes'], 7)
-            self.assertEqual(model.meta['training_ids'], ids[:7])
-            self.assertEqual(model.meta['validation_ids'], ids[7:9])
-            scores = evaluate(model, root, 'validation')
-            self.assertAlmostEqual(scores['summary']['mean_scene_iou'], summary['validation_mean_scene_iou'])
             raw = root / 'unlabeled'
             raw.mkdir()
             empty = np.full((2, 1, 32), 21.)
             np.save(raw/'empty_sensor_samples.npy', empty)
             np.save(raw/'sensor_samples.npy', 2*signals[7].astype('f8') + empty)
             (raw/'acquisition.json').write_text(json.dumps(meta))
-            np.testing.assert_array_equal(model.predict_scene(raw), model.predict(signals[7]))
+            for representation in REPRESENTATIONS:
+                with self.subTest(representation=representation):
+                    checkpoint = root / (representation + '.npz')
+                    summary = fit(root, checkpoint, representation=representation)
+                    model = EchoKernel(checkpoint)
+                    self.assertEqual(model.representation, representation)
+                    self.assertEqual(summary['training_scenes'], 7)
+                    self.assertEqual(model.meta['training_ids'], ids[:7])
+                    self.assertEqual(model.meta['validation_ids'], ids[7:9])
+                    scores = evaluate(model, root, 'validation')
+                    self.assertAlmostEqual(scores['summary']['mean_scene_iou'], summary['validation_mean_scene_iou'])
+                    np.testing.assert_array_equal(model.predict_scene(raw), model.predict(signals[7]))
             (raw/'acquisition.json').write_text(json.dumps(dict(meta, frequency_hz=3e9)))
             with self.assertRaisesRegex(ValueError, 'acquisition'):
                 model.predict_scene(raw)
