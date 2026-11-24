@@ -88,7 +88,7 @@ class MaterialNetwork(nn.Module):
         self.target_mean.copy_(y.mean(0))
         self.target_scale.copy_(y.std(0, unbiased=False).clamp_min(1e-6))
 
-    def forward(self, ports, image, summary):
+    def normalized_output(self, ports, image, summary):
         ports, image, summary = [((x - getattr(self, f"mean{i}")) / getattr(self, f"scale{i}")).clamp(-8, 8)
                                  for i, x in enumerate((ports, image, summary))]
         temporal = self.temporal(ports).transpose(1, 2).reshape(-1, 24, 4, 4)
@@ -96,8 +96,10 @@ class MaterialNetwork(nn.Module):
         condition = self.geometry(torch.cat((self.surface(image), summary[:, :32]), dim=1))
         gain, bias = self.modulation(condition).chunk(2, 1)
         rf = (1 + torch.tanh(gain)) * rf + bias
-        output = self.material(torch.cat((rf, self.summary(summary[:, 32:]), condition), dim=1))
-        return self.target_mean + self.target_scale * output
+        return self.material(torch.cat((rf, self.summary(summary[:, 32:]), condition), dim=1))
+
+    def forward(self, ports, image, summary):
+        return self.target_mean + self.target_scale * self.normalized_output(ports, image, summary)
 
 
 def _train_member(seed, x, y, v, truth, epochs):

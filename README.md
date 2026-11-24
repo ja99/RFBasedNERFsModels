@@ -137,3 +137,19 @@ python Reconstruct.py "$SCENE" prediction.npz --geometry-completion-model "$GEOM
 ```
 
 The geometry checkpoint replaces the kernel geometry estimate in learned compact single-object mode. `depth.pt` uses only the camera for geometry. The material branch still receives RF and depth. With uncertain depth, `--depth-tolerance-mm 3` preserves the learned completion in the uncertain ±3 mm surface band when applying the final camera constraints. The learned features themselves still derive from the measured surface.
+
+### Material means and predictive variances
+
+`BetaMaterial.py` trains the depth-conditioned material regressor with a positive variance head for each homogeneous inclusion property. The trainer compares matched MSE, Gaussian NLL and beta-weighted Gaussian NLL (β = 0.5 and 1) with three seeds and identical mean-error checkpoint selection. The weight on each NLL term is detached, following [Seitzer et al.](https://openreview.net/forum?id=aPOpXlnV1T). All losses use training-standardized targets. Mixture variance combines mean member variance and variance of the member means. Validation residuals calibrate a separate variance multiplier for each property and determine the beta checkpoint by ordinary Gaussian NLL. Intervals use a moment-matched Gaussian marginal for each property. They describe prediction errors within the simulated training family.
+
+With `VIEW` as the broadside archive pair, `DEPTH` as the depth-camera study and `ARCH` as the architecture study, run the matched local benchmark using
+
+```bash
+python BetaMaterial.py study --view "$VIEW" --frames "$DEPTH/frames" \
+  --independent "$ARCH/independent-broadside" --independent-frames "$ARCH/independent-frames" \
+  --point "$ARCH/material/ensemble.pt" --kernel "$DEPTH/material/fusion.npz" --output "$OUT"
+```
+
+Read `selection.json` for the validation-selected checkpoint. This study selected `beta_one.pt`. For one saved measurement, `BetaMaterial.py infer --model "$OUT/beta_one.pt" --scene "$SCENE" --depth "$SCENE/depth.npy" --camera "$SCENE/camera.json"` returns means, variances in squared property units, and nominal marginal 90% intervals. Add `--point "$ARCH/material/ensemble.pt" --kernel "$DEPTH/material/fusion.npz" --blend-calibration "$OUT/blend_variance.json"` to keep the previous blend's means and attach variances calibrated to its own validation residuals.
+
+The standard `Reconstruct.py` command accepts `--depth-material-model "$OUT/beta_one.pt" --material-uncertainty` with the usual depth, camera and geometry options. It composes the expected inclusion properties with the predicted object mask and saves the ordered scalar arrays `inclusion_material_mean`, `inclusion_material_variance` and `inclusion_material_parameters`. These are material moments conditional on the single-inclusion model. Geometry uncertainty is a separate quantity.

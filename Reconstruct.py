@@ -81,7 +81,7 @@ def acquisition_protocol(acquisition):
 
 def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", weights_dir=None, simulator=None,
                 clearance_cells=None, scene_id=None, depth=None, camera=None, depth_material_model=None, geometry_model=None,
-                depth_geometry=False, depth_tolerance_mm=0.0, material_blend_baseline=None, geometry_completion_model=None):
+                depth_geometry=False, depth_tolerance_mm=0.0, material_blend_baseline=None, geometry_completion_model=None, material_uncertainty=False):
     """Predict on the protocol’s native grid using its paired receiver recordings."""
     if mode not in ("single", "mixed", "metre") or device not in ("cpu", "cuda"):
         raise ValueError("Choose single, mixed or metre mode and a cpu or cuda device")
@@ -95,6 +95,8 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
         raise ValueError("Depth fusion requires --depth, --camera and --depth-material-model in learned compact single mode")
     if material_blend_baseline is not None and (not use_depth or Path(depth_material_model).suffix != ".pt"):
         raise ValueError("--material-blend-baseline requires a neural .pt depth material model")
+    if material_uncertainty and (not use_depth or material_blend_baseline is not None):
+        raise ValueError("--material-uncertainty requires a calibrated beta material checkpoint without blending")
     if geometry_completion_model is not None:
         if geometry_model is not None:
             raise ValueError("Choose either --geometry-completion-model or --geometry-model")
@@ -167,7 +169,12 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
                     geometry_settings = kernel.settings
                     sdf = kernel.predict(calibrated_subset(scene, kernel.settings))
                     sensor_info["geometry_source"] = "rf"
-                if Path(depth_material_model).suffix == ".pt":
+                if material_uncertainty:
+                    from BetaMaterial import BetaMaterial
+
+                    fused = BetaMaterial(depth_material_model)
+                    sensor_info["material_estimator"] = fused.meta["loss"]
+                elif Path(depth_material_model).suffix == ".pt":
                     from NeuralDepthMaterial import NeuralDepthMaterial
 
                     fused = NeuralDepthMaterial(depth_material_model, material_blend_baseline)
@@ -178,6 +185,11 @@ def reconstruct(scene, output, *, mode="single", refine=False, device="cpu", wei
                     raise ValueError("Expected a registered RF and depth fusion model for this reconstruction grid")
                 estimate = fused.predict(wave=calibrated_subset(scene, fused.settings), depth=frame,
                                          camera=calibration_spec)
+                if material_uncertainty:
+                    estimate, variance = estimate
+                    sensor_info["inclusion_material_mean"] = estimate
+                    sensor_info["inclusion_material_variance"] = variance
+                    sensor_info["inclusion_material_parameters"] = ["relative_permittivity", "conductivity_s_per_m"]
                 if depth_geometry and geometry_completion_model is None:
                     from DepthGeometry import constrain, registered_camera
                     from EchoKernel import occupancy_sdf
@@ -255,6 +267,8 @@ def main():
                         help="Depth uncertainty half-width in mm for carving and surface pinning (ideal frames: 0)")
     parser.add_argument("--camera", type=Path, help="Depth camera calibration JSON")
     parser.add_argument("--depth-material-model", type=Path, help="Trained kernel (.npz) or neural (.pt) depth material model")
+    parser.add_argument("--material-uncertainty", action="store_true",
+                        help="Use BetaMaterial mean fields and save inclusion-level marginal predictive variances")
     parser.add_argument("--material-blend-baseline", type=Path, help="Kernel checkpoint for the validation-selected neural blend")
     parser.add_argument("--geometry-completion-model", type=Path,
                         help="Predict convex support behind observed depth surfaces using a DepthCompletion checkpoint")
